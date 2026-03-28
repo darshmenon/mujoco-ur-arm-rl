@@ -23,13 +23,11 @@ class LiveViewerCallback(BaseCallback):
         super().__init__()
         self._render_every = render_every
         self._viewer = None
-        self._env = None
 
     def _on_training_start(self):
-        # Spawn a separate env just for rendering
-        self._env = URDualArmEnv()
-        self._env.reset()
-        self._viewer = mujoco.viewer.launch_passive(self._env.model, self._env.data)
+        # Connect directly to the first training env so we see actual arm movement
+        env0 = self.training_env.envs[0]
+        self._viewer = mujoco.viewer.launch_passive(env0.model, env0.data)
 
     def _on_step(self):
         if self.n_calls % self._render_every == 0 and self._viewer:
