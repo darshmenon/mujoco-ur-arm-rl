@@ -2,75 +2,109 @@
 
 ## What This Project Is
 
-This project trains robotic arms to perform manipulation tasks using reinforcement learning inside a physics simulator. The idea is to teach robots useful skills — reaching, picking, placing, and handing objects between arms — entirely in simulation, then deploy the learned policies to real hardware.
+This project trains robotic arms to perform pick-and-place tasks using reinforcement learning inside a physics simulator. The goal is to teach robots useful skills — reaching, grasping, lifting, and placing objects — entirely in simulation, then deploy the learned policies to real hardware via ROS2.
 
 ## The Simulator: MuJoCo
 
-MuJoCo (Multi-Joint dynamics with Contact) is a physics engine built for robotics research. It simulates rigid body dynamics, contacts, and actuator physics accurately and fast. We use it to run thousands of episodes of the robot attempting tasks, which would be impossible (and dangerous) to do on real hardware.
+MuJoCo (Multi-Joint dynamics with Contact) is a physics engine built for robotics research. It simulates rigid body dynamics, contacts, and actuator physics accurately and fast enough to run thousands of training episodes per hour. Running this on real hardware would be impossible — a single drop could damage the robot, and each episode would take minutes instead of milliseconds.
+
+Every 5 MuJoCo physics steps = 1 action step. This smooths out the control signal and keeps the simulation stable.
 
 ## The Robot: UR5e + Robotiq 2F-85
 
 The Universal Robots UR5e is a 6-DOF collaborative robot arm widely used in research and industry. We attach a Robotiq 2F-85 two-finger parallel gripper to the end-effector, giving the arm the ability to grasp objects.
 
-All robot models come from [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) — a collection of high-quality MuJoCo models.
+The UR5e has 6 joints (shoulder pan, shoulder lift, elbow, wrist 1, wrist 2, wrist 3). The gripper has 1 actuator but 8 internal joints in the MuJoCo model — this is important because it means each arm occupies 14 qpos slots, not 7. Getting this wrong causes the wrong joints to be set on reset, which was a bug we fixed.
+
+All robot models come from [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie).
 
 ## The Algorithm: SAC
 
-We use Soft Actor-Critic (SAC), an off-policy deep RL algorithm well suited for continuous control. Key properties:
+We use Soft Actor-Critic (SAC), an off-policy deep RL algorithm designed for continuous control.
 
-- **Off-policy**: learns from a replay buffer of past experience, making it sample efficient
-- **Entropy regularization**: encourages exploration by rewarding the agent for acting randomly early on, then gradually committing to good behaviors
-- **Continuous actions**: directly outputs joint velocity commands, no discretization needed
+- **Off-policy**: learns from a replay buffer of past transitions, not just the latest episode. This makes it much more sample-efficient than on-policy algorithms like PPO.
+- **Entropy regularization**: SAC adds an entropy bonus to the reward, encouraging the agent to stay random (explore) early on and only commit to behaviors that are clearly better. The `ent_coef` (entropy coefficient) controls this — if it collapses to near zero too early, the agent stops exploring and gets stuck.
+- **Continuous actions**: outputs 28 continuous numbers (6 joints + 1 gripper per arm × 4 arms), scaled to joint velocity commands.
 
-SAC is implemented via [Stable-Baselines3](https://github.com/DLR-RM/stable-baselines3).
+Key hyperparameters we tuned:
+- `target_entropy = -14` (half of action dim) — keeps exploration alive longer
+- `learning_starts = 5000` — fills the buffer with random experience before training begins
+- `train_freq = 4, gradient_steps = 4` — 4 gradient updates per 4 env steps
 
-## Environments
+## The Phase-Based Reward System
 
-### URReachEnv
-The simplest task — move the end-effector to a randomly placed 3D target. The reward is the negative distance to the target. Good for verifying the training pipeline works.
+The most important design decision in this project. Inspired by the `pickplace-rl-mobile` project.
 
-### URPickPlaceEnv
-A single arm must pick a red box off a table and place it in a green target zone. The reward combines:
-- Distance from end-effector to object (reach)
-- Distance from object to target (place)
-- Height bonus for lifting
+The core problem with naive rewards (e.g. `-distance_to_drop`) is that the agent never sees success early on, so it has no signal to learn from. The fix is to break the task into phases with dense rewards at each stage:
 
-### URDualArmEnv (4-arm)
-Four UR5e arms are arranged around a central table. Each arm has its own set of colored items nearby. A central orange box must be handed from one side to the other and placed in a drop zone. This tests whether agents can learn cooperative behavior across a shared workspace.
+### Phase 0 — Reach
+Move the end-effector to the object's XY position at grasp height. Reward is based on **improvement per step** (delta distance × 100), not absolute distance. This means the agent gets a positive reward every time it moves closer, and a penalty (3× larger) when it moves away. Penalises closing the gripper during approach.
+
+Transition condition: EE within 6cm XY and 4cm Z of object → +100 bonus.
+
+### Phase 1 — Grasp
+Close the gripper while the EE is at the object. Rewards gripper closing when within 5cm. Penalises opening the gripper when close. Touch-range bonuses at <10cm, <4cm, <3cm.
+
+Transition condition: gripper >60% closed AND EE within 5cm → **+1000 bonus**.
+
+### Phase 2 — Lift
+Raise the EE to lift height (0.10m above table). Delta reward on Z distance. Penalises dropping the object (gripper opening).
+
+Transition condition: within 5cm of lift height → +200 bonus.
+
+### Phase 3 — Place
+Move the object over the drop zone and open the gripper. Delta reward on XY distance to drop zone.
+
+Success condition: within 8cm of drop zone AND gripper open → **+1000 bonus**, episode ends for this arm.
+
+### Why Deltas Not Absolutes
+Using `(prev_dist - curr_dist) × scale` instead of `-curr_dist × scale`:
+- The agent starts getting reward immediately (any improvement = positive signal)
+- The reward magnitude is consistent regardless of how far the arm starts
+- Retreating is penalised 2-4× harder than advancing, discouraging oscillation
+
+### Episode Length
+`max_episode_steps = 600` (not time-based). Each episode is at most 600 action steps. This is much shorter than the previous 2001 step limit and forces the agent to learn efficient behavior.
+
+## The 4-Arm Environment (URDualArmEnv)
+
+Four UR5e arms arranged symmetrically around a central table:
+
+```
+left2 [-0.9,+0.5] → blue box  → drop at [-0.2,+0.35]
+left1 [-0.9,-0.5] → red box   → drop at [-0.2,-0.35]
+         [   central table + 6 obstacle boxes   ]
+right1[+0.9,-0.5] → green box → drop at [+0.2,-0.35]
+right2[+0.9,+0.5] → yellow box→ drop at [+0.2,+0.35]
+```
+
+Each arm is fully independent — it has its own object, its own drop zone, its own phase counter, and its own reward. The episode ends when all 4 arms have successfully placed their objects.
+
+Arms start in a "ready pose" (elbow bent, EE pointing down toward their object at ~0.25m distance) instead of the default upright pose which puts the EE 1.3m away.
 
 ## Observation Space
 
-Each agent observes:
-- Joint positions and velocities of its arm(s)
-- End-effector position(s) in world frame
-- Object position
-- Target/drop zone position
-- Gripper state
+Per arm (23 values × 4 arms = 92 total):
+- Joint positions (6) + velocities (6)
+- End-effector position in world frame (3)
+- Object position (3)
+- Drop zone position (3)
+- Gripper finger joint position (1)
+- Current phase (1)
 
 ## Action Space
 
-Normalized joint velocity commands in [-1, 1], scaled before being sent to the simulator. One extra action per arm controls the gripper (open/close).
-
-## Training Loop
-
-1. Agent takes an action based on current observation
-2. Simulator steps forward (5 physics steps per action)
-3. Reward is computed from the new state
-4. Transition is stored in a replay buffer
-5. SAC samples a batch and updates the actor and critic networks
-6. Repeat for 500k–1M timesteps
-
-## Live Viewer
-
-During training, a passive MuJoCo viewer syncs with the environment every few steps so you can watch the arms move in real time as the policy improves.
+28 values (7 per arm × 4 arms):
+- 6 joint velocity commands in [-1, 1], scaled by 0.5 rad/s
+- 1 gripper command: -1=open, +1=close, mapped to [0, 0.8]
 
 ## ROS2 Integration
 
-A ROS2 inference node (`ros2/ur_policy_node.py`) loads a trained SAC model and publishes joint trajectory commands to a real UR5e over ROS2. It subscribes to `/joint_states` and publishes to the UR's trajectory controller at 10Hz.
+A ROS2 inference node (`ros2/ur_policy_node.py`) loads a trained SAC model and publishes joint trajectory commands to a real UR5e. It subscribes to `/joint_states` and publishes to the UR's trajectory controller at 10Hz.
 
 ## Future Work
 
-- Curriculum learning: start with easy targets, gradually increase difficulty
-- Multi-task learning: single policy for reach, pick, place, handover
-- Isaac Lab: GPU-accelerated parallel training (1000x faster than CPU MuJoCo)
-- Sim-to-real transfer: domain randomization to close the gap between sim and real robot
+- Isaac Lab: GPU-accelerated parallel training (1000× faster than CPU MuJoCo)
+- Sim-to-real: domain randomization on object mass, friction, and visual appearance
+- Multi-task: single policy that handles reach, pick, place, and handover
+- Curriculum: start with objects close to the drop zone, gradually increase difficulty

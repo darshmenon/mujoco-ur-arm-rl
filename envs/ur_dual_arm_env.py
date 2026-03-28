@@ -185,11 +185,18 @@ class URDualArmEnv(gym.Env):
             for n in arm_names
         ]
 
-        # obs per arm: qpos(6) + qvel(6) + ee(3) + obj(3) + drop(3) + gripper(1) = 22
-        obs_dim = self._n_arms * 22
+        # obs per arm: qpos(6) + qvel(6) + ee(3) + obj(3) + drop(3) + gripper(1) + phase(1) = 23
+        obs_dim = self._n_arms * 23
         self.observation_space = spaces.Box(-np.inf, np.inf, shape=(obs_dim,), dtype=np.float32)
         self.action_space = spaces.Box(-1.0, 1.0, shape=(self._n_ctrl,), dtype=np.float32)
         self._viewer = None
+
+        # Phase state per arm
+        self._phase        = [0] * self._n_arms   # 0=reach 1=approach 2=grasp 3=lift 4=place
+        self._prev_dist    = [None] * self._n_arms
+        self._grasped      = [False] * self._n_arms
+        self._episode_steps = 0
+        self.max_episode_steps = 600
 
     def _get_obs(self):
         parts = []
@@ -202,6 +209,7 @@ class URDualArmEnv(gym.Env):
             parts.append(self.data.xpos[self._obj_ids[i]].astype(np.float32))
             parts.append(self._drop_positions[i].astype(np.float32))
             parts.append(np.array([self.data.qpos[self._grip_qpos_adr[i]]], dtype=np.float32))
+            parts.append(np.array([float(self._phase[i])], dtype=np.float32))
         return np.concatenate(parts)
 
     def reset(self, seed=None, options=None):
@@ -228,11 +236,130 @@ class URDualArmEnv(gym.Env):
             self.data.qpos[base:base+3] = init_pos
             self.data.qpos[base+3:base+7] = [1, 0, 0, 0]
 
+        # Reset phase state
+        self._phase         = [0] * self._n_arms
+        self._prev_dist     = [None] * self._n_arms
+        self._grasped       = [False] * self._n_arms
+        self._episode_steps = 0
+
         mujoco.mj_forward(self.model, self.data)
         return self._get_obs(), {}
 
+    def _arm_reward(self, i):
+        """Phase-based reward for arm i, ported from pickplace_env."""
+        ee   = self.data.site_xpos[self._ee_sites[i]].copy()
+        obj  = self.data.xpos[self._obj_ids[i]].copy()
+        drop = self._drop_positions[i]
+        grip = float(self.data.qpos[self._grip_qpos_adr[i]])
+        va   = self._arm_qvel_adr[i]
+        joint_vel_penalty = 0.01 * float(np.sum(np.abs(self.data.qvel[va:va+self._n_arm])))
+
+        reward = 0.0
+        terminated_arm = False
+        phase = self._phase[i]
+
+        if phase == 0:
+            # Reach: move EE toward object XY, correct Z (grasp height)
+            grasp_z = float(obj[2])
+            dist_xy = float(np.linalg.norm(ee[:2] - obj[:2]))
+            dist_z  = abs(ee[2] - grasp_z)
+            dist    = dist_xy + dist_z
+
+            if self._prev_dist[i] is not None:
+                delta = self._prev_dist[i] - dist
+                reward += delta * 100.0 if delta > 0 else delta * 200.0
+            self._prev_dist[i] = dist
+
+            # Proximity bonuses
+            if dist_xy < 0.12:
+                reward += 4.0 * (1.0 - dist_xy / 0.12)
+            if dist_z < 0.05:
+                reward += 3.0 * (1.0 - dist_z / 0.05)
+            if dist_xy < 0.08 and dist_z < 0.04:
+                reward += 8.0
+
+            # Penalise closing gripper during approach
+            if grip > 0.5:
+                reward -= 2.0
+
+            # Transition → phase 1
+            if dist_xy < 0.06 and dist_z < 0.04:
+                self._phase[i] = 1
+                self._prev_dist[i] = None
+                reward += 100.0
+
+        elif phase == 1:
+            # Grasp: close gripper at object
+            dist = float(np.linalg.norm(ee - obj))
+
+            if self._prev_dist[i] is not None:
+                delta = self._prev_dist[i] - dist
+                reward += delta * 100.0 if delta > 0 else delta * 400.0
+            self._prev_dist[i] = dist
+
+            if dist < 0.10:
+                reward += 8.0 * (1.0 - dist / 0.10)
+            if dist < 0.04:
+                reward += 15.0 * (1.0 - dist / 0.04)
+            if dist < 0.03:
+                reward += 10.0
+
+            # Encourage closing gripper when near
+            if grip > 0.4 and dist < 0.06:
+                reward += 8.0 * grip
+            if grip < 0.2 and dist < 0.05:
+                reward -= 5.0
+
+            # Transition → phase 2 (lift)
+            if grip > 0.6 and dist < 0.05:
+                self._grasped[i] = True
+                self._phase[i] = 2
+                self._prev_dist[i] = None
+                reward += 1000.0
+
+        elif phase == 2:
+            # Lift: raise EE to lift height
+            if grip < 0.3:
+                reward -= 20.0  # dropping the object
+
+            dist_z = abs(ee[2] - LIFT_Z)
+            if self._prev_dist[i] is not None:
+                delta = self._prev_dist[i] - dist_z
+                reward += delta * 100.0 if delta > 0 else delta * 200.0
+            self._prev_dist[i] = dist_z
+
+            if dist_z < 0.08:
+                reward += 5.0 * (1.0 - dist_z / 0.08)
+
+            # Transition → phase 3 (place)
+            if dist_z < 0.05:
+                self._phase[i] = 3
+                self._prev_dist[i] = None
+                reward += 200.0
+
+        elif phase == 3:
+            # Place: move object to drop zone and release
+            if grip < 0.3:
+                reward -= 20.0
+
+            dist = float(np.linalg.norm(ee[:2] - drop[:2]))
+            if self._prev_dist[i] is not None:
+                delta = self._prev_dist[i] - dist
+                reward += delta * 50.0
+            self._prev_dist[i] = dist
+
+            # Success: over drop zone and gripper opened
+            if dist < 0.08 and grip < 0.1:
+                self._grasped[i] = False
+                reward += 1000.0
+                terminated_arm = True
+
+        reward -= joint_vel_penalty
+        return reward, terminated_arm, phase
+
     def step(self, action):
-        # Apply arm + gripper controls (ctrl layout: 7 per arm = 6 arm + 1 gripper)
+        self._episode_steps += 1
+
         for i in range(self._n_arms):
             s = i * 7
             self.data.ctrl[s:s+self._n_arm] = action[s:s+self._n_arm] * 0.5
@@ -243,57 +370,25 @@ class URDualArmEnv(gym.Env):
         for _ in range(5):
             mujoco.mj_step(self.model, self.data)
 
-        reward = 0.0
+        total_reward = 0.0
         info = {}
-        all_placed = True
+        all_done = True
 
         for i in range(self._n_arms):
-            arm_name = ARM_CFG[i][0]
-            ee       = self.data.site_xpos[self._ee_sites[i]]
-            obj      = self.data.xpos[self._obj_ids[i]]
-            drop     = self._drop_positions[i]
-            grip_q   = self.data.qpos[self._grip_qpos_adr[i]]
+            r, arm_done, phase = self._arm_reward(i)
+            total_reward += r
+            if not arm_done:
+                all_done = False
+            info[f"{ARM_CFG[i][0]}_phase"]  = phase
+            info[f"{ARM_CFG[i][0]}_done"]   = arm_done
 
-            dist_ee_obj  = float(np.linalg.norm(ee - obj))
-            dist_obj_drop = float(np.linalg.norm(obj[:2] - drop[:2]))
-            obj_height   = float(obj[2])
-            lifted       = obj_height > LIFT_Z
-
-            # --- Staged reward ---
-            # 1. Reach: always active, pull EE toward object
-            reward -= 0.3 * dist_ee_obj
-
-            # 2. Grasp: bonus when EE is close AND gripper is closing
-            if dist_ee_obj < 0.10 and grip_q > 0.15:
-                reward += 0.5
-
-            # 3. Lift: reward proportional to height above table
-            lift_bonus = max(0.0, obj_height - (TABLE_Z + 0.03))
-            reward += 3.0 * lift_bonus
-
-            # 4. Place: only penalise drop distance once object is lifted
-            if lifted:
-                reward -= 0.8 * dist_obj_drop
-
-            # 5. Success per arm
-            placed = dist_obj_drop < 0.06 and obj_height < TABLE_Z + 0.05
-            if placed:
-                reward += 5.0
-            else:
-                all_placed = False
-
-            info[f"{arm_name}_dist_ee"]   = dist_ee_obj
-            info[f"{arm_name}_dist_drop"] = dist_obj_drop
-            info[f"{arm_name}_lifted"]    = lifted
-            info[f"{arm_name}_placed"]    = placed
-
-        terminated = all_placed
-        truncated  = self.data.time > 20.0
+        terminated = all_done
+        truncated  = self._episode_steps >= self.max_episode_steps
 
         if self.render_mode == "human":
             self.render()
 
-        return self._get_obs(), reward, terminated, truncated, info
+        return self._get_obs(), total_reward, terminated, truncated, info
 
     def render(self):
         if self.render_mode == "human":
