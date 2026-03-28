@@ -4,13 +4,22 @@ import mujoco.viewer
 import gymnasium as gym
 from gymnasium import spaces
 
+TABLE_Z = 0.02   # table surface z
+LIFT_Z  = 0.10   # z threshold to count as "lifted"
+
+# Each arm: name, base pos, euler_z, object start pos, object color, drop zone pos
+ARM_CFG = [
+    ("left1",  [-0.9, -0.5, 0.0],   0.0, [-0.45, -0.45, 0.045], [0.9, 0.1, 0.1, 1], [-0.2, -0.35, TABLE_Z]),
+    ("left2",  [-0.9,  0.5, 0.0],   0.0, [-0.45,  0.45, 0.045], [0.1, 0.1, 0.9, 1], [-0.2,  0.35, TABLE_Z]),
+    ("right1", [ 0.9, -0.5, 0.0], 180.0, [ 0.45, -0.45, 0.045], [0.1, 0.8, 0.1, 1], [ 0.2, -0.35, TABLE_Z]),
+    ("right2", [ 0.9,  0.5, 0.0], 180.0, [ 0.45,  0.45, 0.045], [0.9, 0.8, 0.1, 1], [ 0.2,  0.35, TABLE_Z]),
+]
+
 
 class URDualArmEnv(gym.Env):
     """
-    Two UR5e arms doing a cooperative handover task:
-    - Arm 1 (left):  picks the object
-    - Arm 2 (right): receives and places it at target
-    Both arms are controlled simultaneously.
+    4x UR5e arms each assigned their own object to pick and place.
+    Staged reward: reach -> grasp -> lift -> place.
     """
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 50}
@@ -21,7 +30,6 @@ class URDualArmEnv(gym.Env):
         spec = mujoco.MjSpec()
         spec.option.gravity = [0, 0, -9.81]
 
-        # Skybox + ground
         tex = spec.add_texture()
         tex.name = "groundplane"
         tex.type = mujoco.mjtTexture.mjTEXTURE_2D
@@ -42,175 +50,209 @@ class URDualArmEnv(gym.Env):
         floor.size = [0, 0, 0.05]
         floor.material = "groundplane"
 
-        light = spec.worldbody.add_light()
-        light.pos = [0, 0, 2]
+        spec.worldbody.add_light().pos = [0, 0, 2.5]
 
-        def attach_arm(parent_spec, arm_name, pos, euler_z):
+        def attach_arm(arm_name, pos, euler_z):
             arm_spec = mujoco.MjSpec.from_file(
                 "/home/asimov/mujoco_menagerie/universal_robots_ur5e/ur5e.xml"
             )
-            gripper_spec = mujoco.MjSpec.from_file(
+            grip_spec = mujoco.MjSpec.from_file(
                 "/home/asimov/mujoco_menagerie/robotiq_2f85/2f85.xml"
             )
-            arm_spec.sites[0].attach_body(
-                gripper_spec.worldbody.first_body(), f"{arm_name}_gr-", ""
-            )
-            mount = parent_spec.worldbody.add_body()
+            arm_spec.sites[0].attach_body(grip_spec.worldbody.first_body(), f"{arm_name}_gr-", "")
+            mount = spec.worldbody.add_body()
             mount.name = f"{arm_name}_mount"
             mount.pos = pos
             mount.alt.euler = [0, 0, euler_z]
+            base = mount.add_geom()
+            base.name = f"{arm_name}_base"
+            base.type = mujoco.mjtGeom.mjGEOM_BOX
+            base.size = [0.1, 0.1, 0.15]
+            base.pos = [0, 0, -0.15]
+            base.rgba = [0.2, 0.2, 0.2, 1]
             frame = mount.add_frame()
             frame.attach_body(arm_spec.worldbody.first_body(), f"{arm_name}_", "")
 
-        attach_arm(spec, "left1",  [-0.9, -0.5, 0.0],  0.0)
-        attach_arm(spec, "left2",  [-0.9,  0.5, 0.0],  0.0)
-        attach_arm(spec, "right1", [ 0.9, -0.5, 0.0], 180.0)
-        attach_arm(spec, "right2", [ 0.9,  0.5, 0.0], 180.0)
+        for arm_name, pos, euler_z, _, _, _ in ARM_CFG:
+            attach_arm(arm_name, pos, euler_z)
 
-        # Large central table between all 4 arms
+        # Central table
         table = spec.worldbody.add_body()
         table.name = "table"
         table.pos = [0.0, 0.0, 0.0]
         tg = table.add_geom()
         tg.name = "table_geom"
         tg.type = mujoco.mjtGeom.mjGEOM_BOX
-        tg.size = [0.6, 0.8, 0.02]
+        tg.size = [0.6, 0.8, TABLE_Z]
         tg.rgba = [0.8, 0.6, 0.4, 1]
 
-        # Items near each arm base (2 per arm = 8 total)
-        items = [
-            # left1 items
-            ("object_l1a", [-0.5, -0.5, 0.045], [0.9, 0.1, 0.1, 1]),
-            ("object_l1b", [-0.4, -0.6, 0.045], [0.9, 0.5, 0.1, 1]),
-            # left2 items
-            ("object_l2a", [-0.5,  0.5, 0.045], [0.1, 0.1, 0.9, 1]),
-            ("object_l2b", [-0.4,  0.6, 0.045], [0.5, 0.1, 0.9, 1]),
-            # right1 items
-            ("object_r1a", [ 0.5, -0.5, 0.045], [0.1, 0.8, 0.1, 1]),
-            ("object_r1b", [ 0.4, -0.6, 0.045], [0.1, 0.8, 0.5, 1]),
-            # right2 items
-            ("object_r2a", [ 0.5,  0.5, 0.045], [0.8, 0.8, 0.1, 1]),
-            ("object_r2b", [ 0.4,  0.6, 0.045], [0.8, 0.4, 0.1, 1]),
+        # Extra static obstacle boxes in center of table
+        extra_boxes = [
+            ([0.0,  0.0,  TABLE_Z+0.025], [0.6, 0.3, 0.3, 1]),
+            ([0.1,  0.2,  TABLE_Z+0.025], [0.3, 0.6, 0.3, 1]),
+            ([-0.1, -0.2, TABLE_Z+0.025], [0.3, 0.3, 0.6, 1]),
+            ([0.0, -0.15, TABLE_Z+0.025], [0.6, 0.6, 0.2, 1]),
+            ([0.15, 0.0,  TABLE_Z+0.025], [0.2, 0.6, 0.6, 1]),
+            ([-0.15, 0.1, TABLE_Z+0.025], [0.6, 0.2, 0.6, 1]),
         ]
-        for name, pos, color in items:
+        for ei, (epos, ecol) in enumerate(extra_boxes):
+            eb = spec.worldbody.add_body()
+            eb.name = f"extra_{ei}"
+            eb.pos = epos
+            efj = eb.add_freejoint()
+            efj.name = f"extra_{ei}_joint"
+            eg = eb.add_geom()
+            eg.name = f"extra_{ei}_geom"
+            eg.type = mujoco.mjtGeom.mjGEOM_BOX
+            eg.size = [0.02, 0.02, 0.02]
+            eg.rgba = ecol
+            eg.mass = 0.05
+            eg.friction = [2.0, 0.01, 0.001]
+
+        # One object per arm + one drop zone per arm
+        for arm_name, _, _, obj_pos, obj_color, drop_pos in ARM_CFG:
             obj = spec.worldbody.add_body()
-            obj.name = name
-            obj.pos = pos
+            obj.name = f"obj_{arm_name}"
+            obj.pos = obj_pos
             fj = obj.add_freejoint()
-            fj.name = f"{name}_joint"
+            fj.name = f"obj_{arm_name}_joint"
             og = obj.add_geom()
-            og.name = f"{name}_geom"
+            og.name = f"obj_{arm_name}_geom"
             og.type = mujoco.mjtGeom.mjGEOM_BOX
             og.size = [0.025, 0.025, 0.025]
-            og.rgba = color
+            og.rgba = obj_color
             og.mass = 0.1
-            og.friction = [1.5, 0.005, 0.0001]
+            og.friction = [2.0, 0.01, 0.001]
 
-        # Central handover object (orange box — no rolling)
-        obj = spec.worldbody.add_body()
-        obj.name = "object"
-        obj.pos = [0.0, 0.0, 0.045]
-        fj = obj.add_freejoint()
-        fj.name = "object_joint"
-        og = obj.add_geom()
-        og.name = "object_geom"
-        og.type = mujoco.mjtGeom.mjGEOM_BOX
-        og.size = [0.03, 0.03, 0.03]
-        og.rgba = [1.0, 0.5, 0.0, 1]
-        og.mass = 0.1
-        og.friction = [2.0, 0.01, 0.001]
-
-        # Drop zones for each right arm
-        for dname, dpos in [("drop1", [0.3, -0.3, 0.022]), ("drop2", [0.3, 0.3, 0.022])]:
             dz = spec.worldbody.add_body()
-            dz.name = dname
-            dz.pos = dpos
+            dz.name = f"drop_{arm_name}"
+            dz.pos = drop_pos
             dzg = dz.add_geom()
-            dzg.name = f"{dname}_geom"
+            dzg.name = f"drop_{arm_name}_geom"
             dzg.type = mujoco.mjtGeom.mjGEOM_CYLINDER
-            dzg.size = [0.05, 0.002, 0]
-            dzg.rgba = [0.1, 0.9, 0.1, 0.4]
+            dzg.size = [0.055, 0.002, 0]
+            dzg.rgba = [0.1, 0.9, 0.1, 0.5]
             dzg.contype = 0
             dzg.conaffinity = 0
 
         self.model = spec.compile()
         self.data = mujoco.MjData(self.model)
 
-        self._n_arm = 6
-        self._n_grip = 1
-        self._n_per_arm = self._n_arm + self._n_grip
-        self._n_arms = 4
-        self._n_ctrl = self._n_per_arm * self._n_arms
+        self._n_arm   = 6
+        self._n_grip  = 1
+        self._n_per   = self._n_arm + self._n_grip
+        self._n_arms  = 4
+        self._n_ctrl  = self._n_per * self._n_arms
 
+        arm_names = [c[0] for c in ARM_CFG]
         self._ee_sites = [
             mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, f"{n}_attachment_site")
-            for n in ["left1", "left2", "right1", "right2"]
+            for n in arm_names
         ]
-        self._obj_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "object")
-        self._drop_pos = np.array([0.3, 0.0, 0.022])
+        self._obj_ids = [
+            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, f"obj_{n}")
+            for n in arm_names
+        ]
+        self._drop_positions = [np.array(c[5]) for c in ARM_CFG]
+        self._obj_init_pos   = [np.array(c[3]) for c in ARM_CFG]
 
-        # obs: 4x(qpos6+qvel6) + 4x ee_pos(3) + obj(3) + drop(3) + grippers(4)
-        obs_dim = self._n_arms * 12 + self._n_arms * 3 + 3 + 3 + self._n_arms
+        # obs per arm: qpos(6) + qvel(6) + ee(3) + obj(3) + drop(3) + gripper(1) = 22
+        obs_dim = self._n_arms * 22
         self.observation_space = spaces.Box(-np.inf, np.inf, shape=(obs_dim,), dtype=np.float32)
         self.action_space = spaces.Box(-1.0, 1.0, shape=(self._n_ctrl,), dtype=np.float32)
-
         self._viewer = None
 
     def _get_obs(self):
         parts = []
         for i in range(self._n_arms):
-            s = i * self._n_per_arm
+            s = i * self._n_per
             parts.append(self.data.qpos[s:s+self._n_arm].astype(np.float32))
             parts.append(self.data.qvel[s:s+self._n_arm].astype(np.float32))
-        for site_id in self._ee_sites:
-            parts.append(self.data.site_xpos[site_id].astype(np.float32))
-        parts.append(self.data.xpos[self._obj_id].astype(np.float32))
-        parts.append(self._drop_pos.astype(np.float32))
-        grips = np.array([
-            self.data.qpos[i * self._n_per_arm + self._n_arm] for i in range(self._n_arms)
-        ], dtype=np.float32)
-        parts.append(grips)
+            parts.append(self.data.site_xpos[self._ee_sites[i]].astype(np.float32))
+            parts.append(self.data.xpos[self._obj_ids[i]].astype(np.float32))
+            parts.append(self._drop_positions[i].astype(np.float32))
+            parts.append(np.array([self.data.qpos[s + self._n_arm]], dtype=np.float32))
         return np.concatenate(parts)
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         mujoco.mj_resetData(self.model, self.data)
-        obj_start = self._n_per_arm * self._n_arms
-        self.data.qpos[obj_start:obj_start+3] = [0.0, 0.0, 0.045]
-        self.data.qpos[obj_start+3:obj_start+7] = [1, 0, 0, 0]
+
+        # Reset each object to its start position
+        obj_qpos_start = self._n_per * self._n_arms
+        for i, init_pos in enumerate(self._obj_init_pos):
+            # each freejoint: 3 pos + 4 quat = 7 dof, plus 8 extra items (decorative)
+            base = obj_qpos_start + i * 7
+            self.data.qpos[base:base+3] = init_pos
+            self.data.qpos[base+3:base+7] = [1, 0, 0, 0]
+
         mujoco.mj_forward(self.model, self.data)
         return self._get_obs(), {}
 
     def step(self, action):
+        # Apply arm + gripper controls
         for i in range(self._n_arms):
-            s = i * self._n_per_arm
+            s = i * self._n_per
             self.data.ctrl[s:s+self._n_arm] = action[s:s+self._n_arm] * 0.5
             grip_idx = s + self._n_arm
             if grip_idx < self.model.nu:
+                # action -1=open, +1=close → map to [0, 0.8]
                 self.data.ctrl[grip_idx] = (action[grip_idx] + 1) / 2 * 0.8
 
         for _ in range(5):
             mujoco.mj_step(self.model, self.data)
 
-        obj_pos = self.data.xpos[self._obj_id]
-        ee_positions = [self.data.site_xpos[sid] for sid in self._ee_sites]
-        dist_ee_obj = min(np.linalg.norm(ee - obj_pos) for ee in ee_positions)
-        dist_obj_drop = np.linalg.norm(obj_pos[:2] - self._drop_pos[:2])
+        reward = 0.0
+        info = {}
+        all_placed = True
 
-        reward = -0.5 * dist_ee_obj - 1.0 * dist_obj_drop
-        if dist_obj_drop < 0.06 and obj_pos[2] < 0.06:
-            reward += 20.0
+        for i in range(self._n_arms):
+            arm_name = ARM_CFG[i][0]
+            ee       = self.data.site_xpos[self._ee_sites[i]]
+            obj      = self.data.xpos[self._obj_ids[i]]
+            drop     = self._drop_positions[i]
+            grip_q   = self.data.qpos[i * self._n_per + self._n_arm]
 
-        terminated = bool(dist_obj_drop < 0.05 and obj_pos[2] < 0.06)
-        truncated = bool(self.data.time > 20.0)
+            dist_ee_obj  = float(np.linalg.norm(ee - obj))
+            dist_obj_drop = float(np.linalg.norm(obj[:2] - drop[:2]))
+            obj_height   = float(obj[2])
+            lifted       = obj_height > LIFT_Z
+
+            # --- Staged reward ---
+            # 1. Reach: always active, pull EE toward object
+            reward -= 0.3 * dist_ee_obj
+
+            # 2. Grasp: bonus when EE is close AND gripper is closing
+            if dist_ee_obj < 0.10 and grip_q > 0.15:
+                reward += 0.5
+
+            # 3. Lift: reward proportional to height above table
+            lift_bonus = max(0.0, obj_height - (TABLE_Z + 0.03))
+            reward += 3.0 * lift_bonus
+
+            # 4. Place: only penalise drop distance once object is lifted
+            if lifted:
+                reward -= 0.8 * dist_obj_drop
+
+            # 5. Success per arm
+            placed = dist_obj_drop < 0.06 and obj_height < TABLE_Z + 0.05
+            if placed:
+                reward += 5.0
+            else:
+                all_placed = False
+
+            info[f"{arm_name}_dist_ee"]   = dist_ee_obj
+            info[f"{arm_name}_dist_drop"] = dist_obj_drop
+            info[f"{arm_name}_lifted"]    = lifted
+            info[f"{arm_name}_placed"]    = placed
+
+        terminated = all_placed
+        truncated  = self.data.time > 20.0
 
         if self.render_mode == "human":
             self.render()
 
-        return self._get_obs(), reward, terminated, truncated, {
-            "dist_ee_obj": dist_ee_obj,
-            "dist_obj_drop": dist_obj_drop,
-        }
+        return self._get_obs(), reward, terminated, truncated, info
 
     def render(self):
         if self.render_mode == "human":
