@@ -25,6 +25,8 @@ Reinforcement learning training environment for the Universal Robots UR5e arm us
 
 Four or more UR5e arms with Robotiq 2F-85 grippers arranged symmetrically. Each arm gets its own table, object, and drop zone, and the layout can scale to 8 arms in the same pattern.
 
+The current multi-arm reward is contact-gated: the policy is rewarded for approaching the object, but grasp/lift progress only counts once the object actually contacts both gripper sides and starts moving upward.
+
 ```bash
 python3 train_dual_arm_live.py --arms 4 --n-envs 4
 
@@ -78,6 +80,44 @@ Useful signals:
 - `ep_rew_mean`: average training reward per finished episode
 - `eval_mean_reward`: evaluation reward from the latest eval pass
 - `fps`: simulation throughput
+
+## ROS2 Package
+
+This repo can also act as a ROS2 Python package named `mujoco_ur_rl_ros2`. The packaged node loads a trained SAC policy and publishes UR5e joint trajectories.
+
+Build it from a ROS2 workspace:
+
+```bash
+mkdir -p ~/ros2_ws/src
+cd ~/ros2_ws/src
+git clone https://github.com/darshmenon/mujoco-ur-arm-rl.git
+cd ~/ros2_ws
+colcon build --packages-select mujoco_ur_rl_ros2
+source install/setup.bash
+```
+
+The ROS2 node still expects the Python environment to have `numpy` and `stable-baselines3` available.
+
+Run the node directly:
+
+```bash
+ros2 run mujoco_ur_rl_ros2 ur_policy_node --ros-args \
+  -p model_path:=/home/asimov/mujoco-ur-arm-rl/models/best_model.zip \
+  -p target_x:=0.4 -p target_y:=0.0 -p target_z:=0.4
+```
+
+Or launch it:
+
+```bash
+ros2 launch mujoco_ur_rl_ros2 ur_policy.launch.py \
+  model_path:=/home/asimov/mujoco-ur-arm-rl/models/best_model.zip
+```
+
+ROS2 files added in this repo:
+- `package.xml`, `setup.py`, `setup.cfg`
+- `mujoco_ur_rl_ros2/ur_policy_node.py`
+- `launch/ur_policy.launch.py`
+- `ros2/ur_policy_node.py` remains as a compatibility wrapper
 
 ## Visualize
 

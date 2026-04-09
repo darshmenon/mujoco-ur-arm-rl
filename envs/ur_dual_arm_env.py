@@ -8,6 +8,11 @@ TABLE_Z = 0.02
 OBJECT_Z = 0.045
 LIFT_Z = 0.10
 Y_SPACING = 1.0
+GRASP_LIFT_THRESHOLD = 0.015
+CARRY_HEIGHT_THRESHOLD = 0.03
+GRASP_CLOSE_THRESHOLD = 0.35
+GRASP_STREAK_STEPS = 3
+STEP_PENALTY = 0.01
 
 ARM_MODEL_PATH = "/home/asimov/mujoco_menagerie/universal_robots_ur5e/ur5e.xml"
 GRIPPER_MODEL_PATH = "/home/asimov/mujoco_menagerie/robotiq_2f85/2f85.xml"
@@ -241,6 +246,24 @@ class URDualArmEnv(gym.Env):
             mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, f"obj_{name}")
             for name in self.arm_names
         ]
+        self._obj_geom_ids = [
+            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, f"obj_{name}_geom")
+            for name in self.arm_names
+        ]
+        self._left_pad_geom_ids = [
+            {
+                mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, f"{name}_{name}_gr-left_pad1"),
+                mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, f"{name}_{name}_gr-left_pad2"),
+            }
+            for name in self.arm_names
+        ]
+        self._right_pad_geom_ids = [
+            {
+                mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, f"{name}_{name}_gr-right_pad1"),
+                mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, f"{name}_{name}_gr-right_pad2"),
+            }
+            for name in self.arm_names
+        ]
         self._drop_positions = [np.array(cfg["drop_pos"], dtype=np.float64) for cfg in self.arm_cfg]
         self._obj_init_pos = [np.array(cfg["obj_pos"], dtype=np.float64) for cfg in self.arm_cfg]
         self._obj_qpos_adr = [
@@ -258,6 +281,7 @@ class URDualArmEnv(gym.Env):
         self._phase = [0] * self._n_arms
         self._prev_dist = [None] * self._n_arms
         self._grasped = [False] * self._n_arms
+        self._grasp_streak = [0] * self._n_arms
         self._episode_steps = 0
         self.max_episode_steps = 500 * self._n_arms
 
@@ -291,10 +315,43 @@ class URDualArmEnv(gym.Env):
         self._phase = [0] * self._n_arms
         self._prev_dist = [None] * self._n_arms
         self._grasped = [False] * self._n_arms
+        self._grasp_streak = [0] * self._n_arms
         self._episode_steps = 0
 
         mujoco.mj_forward(self.model, self.data)
         return self._get_obs(), {}
+
+    def _contact_state(self, i):
+        obj_geom_id = self._obj_geom_ids[i]
+        left_contact = False
+        right_contact = False
+
+        for contact_idx in range(self.data.ncon):
+            contact = self.data.contact[contact_idx]
+            geom1 = int(contact.geom1)
+            geom2 = int(contact.geom2)
+
+            if geom1 == obj_geom_id:
+                other_geom = geom2
+            elif geom2 == obj_geom_id:
+                other_geom = geom1
+            else:
+                continue
+
+            if other_geom in self._left_pad_geom_ids[i]:
+                left_contact = True
+            if other_geom in self._right_pad_geom_ids[i]:
+                right_contact = True
+
+            if left_contact and right_contact:
+                break
+
+        return left_contact, right_contact
+
+    def _is_carrying(self, grip, ee_to_obj, obj_lift, both_contacts):
+        return grip > GRASP_CLOSE_THRESHOLD and (
+            both_contacts or (obj_lift > CARRY_HEIGHT_THRESHOLD and ee_to_obj < 0.12)
+        )
 
     def _arm_reward(self, i):
         ee = self.data.site_xpos[self._ee_sites[i]].copy()
@@ -307,118 +364,128 @@ class URDualArmEnv(gym.Env):
         ee_to_obj = float(np.linalg.norm(ee - obj))
         obj_to_drop_xy = float(np.linalg.norm(obj[:2] - drop[:2]))
         obj_lift = float(obj[2] - init_obj[2])
+        left_contact, right_contact = self._contact_state(i)
+        any_contact = left_contact or right_contact
+        both_contacts = left_contact and right_contact
+        carrying = self._is_carrying(grip, ee_to_obj, obj_lift, both_contacts)
         joint_vel_penalty = 0.01 * float(np.sum(np.abs(self.data.qvel[qvel_adr:qvel_adr + self._n_arm])))
 
-        reward = 0.0
+        reward = -STEP_PENALTY
         terminated_arm = False
         phase = self._phase[i]
 
         if phase == 0:
-            grasp_z = float(obj[2])
-            dist_xy = float(np.linalg.norm(ee[:2] - obj[:2]))
-            dist_z = abs(ee[2] - grasp_z)
-            dist = dist_xy + dist_z
+            dist = ee_to_obj
 
-            reward += 5.0 / (1.0 + dist * 10.0)
+            reward += 3.0 / (1.0 + dist * 10.0)
 
             if self._prev_dist[i] is not None:
                 delta = self._prev_dist[i] - dist
-                reward += delta * 300.0
+                reward += delta * 250.0 if delta > 0 else delta * 120.0
             self._prev_dist[i] = dist
 
-            if dist_xy < 0.20:
-                reward += 15.0 * (1.0 - dist_xy / 0.20)
-            if dist_z < 0.10:
-                reward += 10.0 * (1.0 - dist_z / 0.10)
-            if dist_xy < 0.08 and dist_z < 0.04:
-                reward += 40.0
-
-            if grip > 0.5:
+            if ee_to_obj < 0.15:
+                reward += 8.0 * (1.0 - ee_to_obj / 0.15)
+            if grip > 0.45:
                 reward -= 2.0
-
-            if dist_xy < 0.06 and dist_z < 0.04:
+            if ee_to_obj < 0.08:
                 self._phase[i] = 1
                 self._prev_dist[i] = None
-                reward += 500.0
+                reward += 80.0
 
         elif phase == 1:
-            reward += 5.0 / (1.0 + ee_to_obj * 10.0)
+            reward += 4.0 / (1.0 + ee_to_obj * 10.0)
 
             if self._prev_dist[i] is not None:
                 delta = self._prev_dist[i] - ee_to_obj
-                reward += delta * 300.0
+                reward += delta * 200.0 if delta > 0 else delta * 100.0
             self._prev_dist[i] = ee_to_obj
 
             if ee_to_obj < 0.10:
-                reward += 20.0 * (1.0 - ee_to_obj / 0.10)
-            if ee_to_obj < 0.05:
-                reward += 40.0 * (1.0 - ee_to_obj / 0.05)
-            if ee_to_obj < 0.03:
-                reward += 30.0
+                reward += 12.0 * (1.0 - ee_to_obj / 0.10)
+            if any_contact:
+                reward += 8.0
+            if both_contacts:
+                reward += 14.0
+            if grip > 0.55 and not any_contact:
+                reward -= 2.0
+            if grip < 0.15 and ee_to_obj < 0.05:
+                reward -= 4.0
 
-            reward += 20.0 * grip
-            if ee_to_obj < 0.10:
-                reward += 30.0 * grip
-            if grip > 0.4 and ee_to_obj < 0.06:
-                reward += 50.0 * grip
-            if grip < 0.2 and ee_to_obj < 0.05:
-                reward -= 20.0
+            if grip > GRASP_CLOSE_THRESHOLD and both_contacts:
+                reward += max(0.0, obj_lift) * 600.0
+                if obj_lift > GRASP_LIFT_THRESHOLD:
+                    reward += 15.0
+                    self._grasp_streak[i] += 1
+                    reward += 3.0 * self._grasp_streak[i]
+                else:
+                    self._grasp_streak[i] = 0
+            else:
+                self._grasp_streak[i] = 0
 
-            if grip > 0.35 and ee_to_obj < 0.08:
-                reward += max(0.0, obj_lift) * 800.0
-                if obj_lift > 0.01:
-                    reward += 100.0
-
-            if grip > 0.4 and ee_to_obj < 0.08 and obj_lift > 0.03:
+            if self._grasp_streak[i] >= GRASP_STREAK_STEPS and carrying:
                 self._grasped[i] = True
                 self._phase[i] = 2
                 self._prev_dist[i] = None
-                reward += 2000.0
+                reward += 400.0
 
         elif phase == 2:
-            if grip < 0.3:
-                reward -= 20.0
-                self._grasped[i] = False
-
             dist_z = abs(obj[2] - LIFT_Z)
+
             if self._prev_dist[i] is not None:
                 delta = self._prev_dist[i] - dist_z
-                reward += delta * 150.0 if delta > 0 else delta * 250.0
+                reward += delta * 240.0 if delta > 0 else delta * 140.0
             self._prev_dist[i] = dist_z
 
-            reward += max(0.0, obj_lift) * 120.0
-            reward -= ee_to_obj * 10.0
+            reward += max(0.0, obj_lift) * 150.0
+            if carrying:
+                reward += 6.0
+            else:
+                reward -= 15.0
 
-            if obj_lift < 0.01:
-                reward -= 40.0
+            if not carrying and obj_lift < GRASP_LIFT_THRESHOLD:
+                reward -= 60.0
+                self._grasped[i] = False
+                self._grasp_streak[i] = 0
+                self._phase[i] = 1
+                self._prev_dist[i] = None
             if dist_z < 0.08:
                 reward += 8.0 * (1.0 - dist_z / 0.08)
 
-            if dist_z < 0.05 and obj_lift > 0.03:
+            if carrying and dist_z < 0.05 and obj_lift > CARRY_HEIGHT_THRESHOLD:
                 self._phase[i] = 3
                 self._prev_dist[i] = None
-                reward += 200.0
+                reward += 120.0
 
         elif phase == 3:
-            if grip < 0.1 and obj_to_drop_xy > 0.10:
-                reward -= 40.0
-
             if self._prev_dist[i] is not None:
                 delta = self._prev_dist[i] - obj_to_drop_xy
-                reward += delta * 80.0
+                reward += delta * 120.0 if delta > 0 else delta * 60.0
             self._prev_dist[i] = obj_to_drop_xy
 
-            reward += 5.0 / (1.0 + obj_to_drop_xy * 10.0)
-            if obj_to_drop_xy < 0.10:
-                reward += 25.0 * (1.0 - obj_to_drop_xy / 0.10)
+            if carrying:
+                reward += 4.0 / (1.0 + obj_to_drop_xy * 10.0)
+                if obj_to_drop_xy < 0.10:
+                    reward += 20.0 * (1.0 - obj_to_drop_xy / 0.10)
+                if obj_to_drop_xy < 0.08 and grip < 0.2:
+                    reward += 20.0
+            else:
+                reward -= 20.0
 
-            if obj_to_drop_xy < 0.08 and grip < 0.1 and obj[2] < init_obj[2] + 0.01:
+            if not carrying and obj_lift < GRASP_LIFT_THRESHOLD and obj_to_drop_xy > 0.12:
+                reward -= 60.0
+                self._grasped[i] = False
+                self._grasp_streak[i] = 0
+                self._phase[i] = 1
+                self._prev_dist[i] = None
+
+            if obj_to_drop_xy < 0.08 and grip < 0.1 and obj[2] < init_obj[2] + 0.015:
                 self._grasped[i] = False
                 reward += 1000.0
                 terminated_arm = True
 
         reward -= joint_vel_penalty
-        return reward, terminated_arm, phase
+        return reward, terminated_arm, phase, carrying, both_contacts
 
     def step(self, action):
         self._episode_steps += 1
@@ -438,7 +505,7 @@ class URDualArmEnv(gym.Env):
         all_done = True
 
         for i, name in enumerate(self.arm_names):
-            reward, arm_done, phase = self._arm_reward(i)
+            reward, arm_done, phase, carrying, both_contacts = self._arm_reward(i)
             total_reward += reward
             if not arm_done:
                 all_done = False
@@ -446,6 +513,9 @@ class URDualArmEnv(gym.Env):
             obj = self.data.xpos[self._obj_ids[i]].copy()
             info[f"{name}_phase"] = phase
             info[f"{name}_done"] = arm_done
+            info[f"{name}_carrying"] = carrying
+            info[f"{name}_both_contacts"] = both_contacts
+            info[f"{name}_grasp_streak"] = self._grasp_streak[i]
             info[f"{name}_obj_height"] = float(obj[2])
             info[f"{name}_obj_to_drop"] = float(np.linalg.norm(obj[:2] - self._drop_positions[i][:2]))
 
