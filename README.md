@@ -26,6 +26,8 @@ Reinforcement learning training environment for the Universal Robots UR5e arm us
 Four or more UR5e arms with Robotiq 2F-85 grippers arranged symmetrically. Each arm gets its own table, object, and drop zone, and the layout can scale to 8 arms in the same pattern.
 
 ```bash
+python3 train_dual_arm_live.py --arms 4 --n-envs 4
+
 python3 train_dual_arm_live.py --arms 8 --n-envs 2
 ```
 
@@ -47,6 +49,9 @@ python train.py
 python train_pick_place.py
 
 # Multi-arm training, headless by default
+python3 train_dual_arm_live.py --arms 4 --n-envs 4
+
+# Larger symmetric layout
 python3 train_dual_arm_live.py --arms 8 --n-envs 2
 
 # Same trainer, but with the MuJoCo viewer
