@@ -69,9 +69,19 @@ python3 scripts/train/train_dual_arm_live.py --arms 4 --n-envs 2 --viewer
 
 # Use GPU when PyTorch CUDA is available
 python3 scripts/train/train_dual_arm_live.py --arms 4 --n-envs 4 --device cuda
+
+# Train one reusable 7-action arm policy in an 8-arm scene
+python3 scripts/train/train_shared_arm.py --arms 8 --n-envs 4 --device cuda
+
+# Faster shared-policy mode: every arm in each scene contributes a sample each step
+python3 scripts/train/train_shared_arm.py --arms 8 --n-envs 2 --all-arms-samples --device cuda
+
+# Apply that one shared arm policy to every arm in a 4-arm or 8-arm scene
+python3 scripts/train/play_shared_arm.py --model models/shared_arm/<run_name>/best_model.zip --arms 8 --viewer --deterministic
 ```
 
-Best models and checkpoints are saved under `models/multi_arm/`, run logs under `logs/multi_arm/`.
+Best multi-arm models and checkpoints are saved under `models/multi_arm/`, run logs under `logs/multi_arm/`.
+Shared one-arm policy runs use `models/shared_arm/` and `logs/shared_arm/`.
 
 ## Monitor Progress
 

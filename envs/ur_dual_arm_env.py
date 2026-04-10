@@ -13,6 +13,18 @@ CARRY_HEIGHT_THRESHOLD = 0.03
 GRASP_CLOSE_THRESHOLD = 0.35
 GRASP_STREAK_STEPS = 3
 STEP_PENALTY = 0.01
+OBJECT_RESET_X_MARGIN = 0.25
+OBJECT_RESET_Y_MARGIN = 0.25
+OBJECT_RESET_Z_MIN = 0.0
+OBJECT_RESET_Z_MAX = 0.5
+OBJECT_RESET_PENALTY = 250.0
+OBJECT_MASS = 0.25
+REACH_DELTA_GAIN = 360.0
+GRASP_DELTA_GAIN = 320.0
+LIFT_DELTA_GAIN = 360.0
+CARRY_DELTA_GAIN = 240.0
+ARM_ACTION_SCALE = np.array([1.2, 1.1, 1.2, 1.1, 0.9, 0.9], dtype=np.float64)
+CURRICULUM_MODES = {"none", "easy_grasp"}
 
 ARM_MODEL_PATH = "/home/asimov/mujoco_menagerie/universal_robots_ur5e/ur5e.xml"
 GRIPPER_MODEL_PATH = "/home/asimov/mujoco_menagerie/robotiq_2f85/2f85.xml"
@@ -21,7 +33,6 @@ SIDE_CFG = {
     "left": {
         "base_x": -0.9,
         "table_x": -1.18,
-        "object_x": -1.05,
         "drop_x": -1.25,
         "euler_z": 0.0,
         "ready_pose": np.array([np.pi, -1.0, 1.5, -1.57, -1.57, 0.0], dtype=np.float64),
@@ -29,7 +40,6 @@ SIDE_CFG = {
     "right": {
         "base_x": 0.9,
         "table_x": 0.58,
-        "object_x": 0.45,
         "drop_x": 0.68,
         "euler_z": 180.0,
         "ready_pose": np.array([0.0, -1.0, 1.5, -1.57, -1.57, 0.0], dtype=np.float64),
@@ -46,18 +56,6 @@ OBJECT_COLORS = [
     [0.95, 0.45, 0.1, 1.0],
     [0.5, 0.9, 0.1, 1.0],
 ]
-
-OBSTACLE_COLORS = [
-    [0.6, 0.3, 0.3, 1.0],
-    [0.3, 0.6, 0.3, 1.0],
-    [0.3, 0.3, 0.6, 1.0],
-    [0.6, 0.6, 0.2, 1.0],
-    [0.6, 0.2, 0.6, 1.0],
-    [0.2, 0.6, 0.6, 1.0],
-    [0.8, 0.4, 0.2, 1.0],
-    [0.4, 0.8, 0.2, 1.0],
-]
-
 
 def _centered_y_positions(count_per_side):
     offset = (count_per_side - 1) / 2.0
@@ -84,11 +82,10 @@ def _build_arm_cfg(arm_count):
                     "euler_z": side_cfg["euler_z"],
                     "table_pos": [side_cfg["table_x"], y_pos],
                     "table_size": [0.28, 0.20],
-                    "obj_pos": [side_cfg["object_x"], y_pos, OBJECT_Z],
+                    "obj_pos": [side_cfg["table_x"], y_pos, OBJECT_Z],
                     "obj_color": OBJECT_COLORS[color_idx],
                     "drop_pos": [side_cfg["drop_x"], y_pos, TABLE_Z],
                     "ready_pose": side_cfg["ready_pose"].copy(),
-                    "obstacle_color": OBSTACLE_COLORS[color_idx % len(OBSTACLE_COLORS)],
                 }
             )
 
@@ -103,8 +100,12 @@ class URDualArmEnv(gym.Env):
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 50}
 
-    def __init__(self, render_mode=None, arm_count=4):
+    def __init__(self, render_mode=None, arm_count=4, curriculum_mode="none"):
+        if curriculum_mode not in CURRICULUM_MODES:
+            raise ValueError(f"curriculum_mode must be one of {sorted(CURRICULUM_MODES)}")
+
         self.render_mode = render_mode
+        self.curriculum_mode = curriculum_mode
         self.arm_cfg = _build_arm_cfg(arm_count)
 
         spec = mujoco.MjSpec()
@@ -166,21 +167,6 @@ class URDualArmEnv(gym.Env):
             table_geom.size = [cfg["table_size"][0], cfg["table_size"][1], TABLE_Z]
             table_geom.rgba = [0.8, 0.6, 0.4, 1.0]
 
-            extra = spec.worldbody.add_body()
-            extra.name = f"extra_{cfg['name']}"
-            extra.pos = [cfg["table_pos"][0], cfg["table_pos"][1], TABLE_Z + 0.025]
-
-            extra_joint = extra.add_freejoint()
-            extra_joint.name = f"extra_{cfg['name']}_joint"
-
-            extra_geom = extra.add_geom()
-            extra_geom.name = f"extra_{cfg['name']}_geom"
-            extra_geom.type = mujoco.mjtGeom.mjGEOM_BOX
-            extra_geom.size = [0.02, 0.02, 0.02]
-            extra_geom.rgba = cfg["obstacle_color"]
-            extra_geom.mass = 0.05
-            extra_geom.friction = [2.0, 0.01, 0.001]
-
             obj = spec.worldbody.add_body()
             obj.name = f"obj_{cfg['name']}"
             obj.pos = cfg["obj_pos"]
@@ -193,7 +179,7 @@ class URDualArmEnv(gym.Env):
             obj_geom.type = mujoco.mjtGeom.mjGEOM_BOX
             obj_geom.size = [0.025, 0.025, 0.025]
             obj_geom.rgba = cfg["obj_color"]
-            obj_geom.mass = 0.1
+            obj_geom.mass = OBJECT_MASS
             obj_geom.friction = [2.0, 0.01, 0.001]
 
             drop = spec.worldbody.add_body()
@@ -272,6 +258,12 @@ class URDualArmEnv(gym.Env):
             ]
             for name in self.arm_names
         ]
+        self._obj_qvel_adr = [
+            self.model.jnt_dofadr[
+                mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, f"obj_{name}_joint")
+            ]
+            for name in self.arm_names
+        ]
 
         obs_dim = self._n_arms * 23
         self.observation_space = spaces.Box(-np.inf, np.inf, shape=(obs_dim,), dtype=np.float32)
@@ -284,6 +276,47 @@ class URDualArmEnv(gym.Env):
         self._grasp_streak = [0] * self._n_arms
         self._episode_steps = 0
         self.max_episode_steps = 500 * self._n_arms
+
+    def _reset_object_pos(self, i):
+        base_pos = self._obj_init_pos[i].copy()
+        if self.curriculum_mode == "none":
+            return base_pos
+
+        cfg = self.arm_cfg[i]
+        table_x, table_y = cfg["table_pos"]
+
+        return np.array(
+            [
+                table_x,
+                table_y,
+                OBJECT_Z,
+            ],
+            dtype=np.float64,
+        )
+
+    def _object_out_of_bounds(self, i, obj):
+        cfg = self.arm_cfg[i]
+        table_x, table_y = cfg["table_pos"]
+        table_half_x, table_half_y = cfg["table_size"]
+
+        return (
+            abs(float(obj[0]) - table_x) > table_half_x + OBJECT_RESET_X_MARGIN
+            or abs(float(obj[1]) - table_y) > table_half_y + OBJECT_RESET_Y_MARGIN
+            or float(obj[2]) < OBJECT_RESET_Z_MIN
+            or float(obj[2]) > OBJECT_RESET_Z_MAX
+        )
+
+    def _reset_object_to_table(self, i):
+        obj_qpos_adr = self._obj_qpos_adr[i]
+        obj_qvel_adr = self._obj_qvel_adr[i]
+        self.data.qpos[obj_qpos_adr:obj_qpos_adr + 3] = self._obj_init_pos[i]
+        self.data.qpos[obj_qpos_adr + 3:obj_qpos_adr + 7] = [1, 0, 0, 0]
+        self.data.qvel[obj_qvel_adr:obj_qvel_adr + 6] = 0.0
+        self._phase[i] = 0
+        self._prev_dist[i] = None
+        self._grasped[i] = False
+        self._grasp_streak[i] = 0
+        mujoco.mj_forward(self.model, self.data)
 
     def _get_obs(self):
         parts = []
@@ -306,8 +339,14 @@ class URDualArmEnv(gym.Env):
         for i, cfg in enumerate(self.arm_cfg):
             qpos_adr = self._arm_qpos_adr[i]
             self.data.qpos[qpos_adr:qpos_adr + self._n_arm] = cfg["ready_pose"]
+            ctrl_start = i * 7
+            self.data.ctrl[ctrl_start:ctrl_start + self._n_arm] = cfg["ready_pose"]
+            grip_idx = ctrl_start + self._n_arm
+            self.data.ctrl[grip_idx] = self.model.actuator_ctrlrange[grip_idx, 0]
 
-        for i, init_pos in enumerate(self._obj_init_pos):
+        for i in range(self._n_arms):
+            init_pos = self._reset_object_pos(i)
+            self._obj_init_pos[i] = init_pos
             obj_qpos_adr = self._obj_qpos_adr[i]
             self.data.qpos[obj_qpos_adr:obj_qpos_adr + 3] = init_pos
             self.data.qpos[obj_qpos_adr + 3:obj_qpos_adr + 7] = [1, 0, 0, 0]
@@ -377,47 +416,47 @@ class URDualArmEnv(gym.Env):
         if phase == 0:
             dist = ee_to_obj
 
-            reward += 3.0 / (1.0 + dist * 10.0)
+            reward += 4.5 / (1.0 + dist * 10.0)
 
             if self._prev_dist[i] is not None:
                 delta = self._prev_dist[i] - dist
-                reward += delta * 250.0 if delta > 0 else delta * 120.0
+                reward += delta * REACH_DELTA_GAIN if delta > 0 else delta * 90.0
             self._prev_dist[i] = dist
 
             if ee_to_obj < 0.15:
-                reward += 8.0 * (1.0 - ee_to_obj / 0.15)
+                reward += 12.0 * (1.0 - ee_to_obj / 0.15)
             if grip > 0.45:
                 reward -= 2.0
             if ee_to_obj < 0.08:
                 self._phase[i] = 1
                 self._prev_dist[i] = None
-                reward += 80.0
+                reward += 120.0
 
         elif phase == 1:
-            reward += 4.0 / (1.0 + ee_to_obj * 10.0)
+            reward += 6.0 / (1.0 + ee_to_obj * 10.0)
 
             if self._prev_dist[i] is not None:
                 delta = self._prev_dist[i] - ee_to_obj
-                reward += delta * 200.0 if delta > 0 else delta * 100.0
+                reward += delta * GRASP_DELTA_GAIN if delta > 0 else delta * 80.0
             self._prev_dist[i] = ee_to_obj
 
             if ee_to_obj < 0.10:
-                reward += 12.0 * (1.0 - ee_to_obj / 0.10)
+                reward += 18.0 * (1.0 - ee_to_obj / 0.10)
             if any_contact:
-                reward += 8.0
+                reward += 16.0
             if both_contacts:
-                reward += 14.0
+                reward += 30.0
             if grip > 0.55 and not any_contact:
-                reward -= 2.0
+                reward -= 3.0
             if grip < 0.15 and ee_to_obj < 0.05:
                 reward -= 4.0
 
             if grip > GRASP_CLOSE_THRESHOLD and both_contacts:
-                reward += max(0.0, obj_lift) * 600.0
+                reward += max(0.0, obj_lift) * 900.0
                 if obj_lift > GRASP_LIFT_THRESHOLD:
-                    reward += 15.0
+                    reward += 35.0
                     self._grasp_streak[i] += 1
-                    reward += 3.0 * self._grasp_streak[i]
+                    reward += 6.0 * self._grasp_streak[i]
                 else:
                     self._grasp_streak[i] = 0
             else:
@@ -427,19 +466,19 @@ class URDualArmEnv(gym.Env):
                 self._grasped[i] = True
                 self._phase[i] = 2
                 self._prev_dist[i] = None
-                reward += 400.0
+                reward += 650.0
 
         elif phase == 2:
             dist_z = abs(obj[2] - LIFT_Z)
 
             if self._prev_dist[i] is not None:
                 delta = self._prev_dist[i] - dist_z
-                reward += delta * 240.0 if delta > 0 else delta * 140.0
+                reward += delta * LIFT_DELTA_GAIN if delta > 0 else delta * 100.0
             self._prev_dist[i] = dist_z
 
-            reward += max(0.0, obj_lift) * 150.0
+            reward += max(0.0, obj_lift) * 260.0
             if carrying:
-                reward += 6.0
+                reward += 16.0
             else:
                 reward -= 15.0
 
@@ -450,25 +489,25 @@ class URDualArmEnv(gym.Env):
                 self._phase[i] = 1
                 self._prev_dist[i] = None
             if dist_z < 0.08:
-                reward += 8.0 * (1.0 - dist_z / 0.08)
+                reward += 14.0 * (1.0 - dist_z / 0.08)
 
             if carrying and dist_z < 0.05 and obj_lift > CARRY_HEIGHT_THRESHOLD:
                 self._phase[i] = 3
                 self._prev_dist[i] = None
-                reward += 120.0
+                reward += 220.0
 
         elif phase == 3:
             if self._prev_dist[i] is not None:
                 delta = self._prev_dist[i] - obj_to_drop_xy
-                reward += delta * 120.0 if delta > 0 else delta * 60.0
+                reward += delta * CARRY_DELTA_GAIN if delta > 0 else delta * 70.0
             self._prev_dist[i] = obj_to_drop_xy
 
             if carrying:
-                reward += 4.0 / (1.0 + obj_to_drop_xy * 10.0)
+                reward += 10.0 / (1.0 + obj_to_drop_xy * 10.0)
                 if obj_to_drop_xy < 0.10:
-                    reward += 20.0 * (1.0 - obj_to_drop_xy / 0.10)
+                    reward += 40.0 * (1.0 - obj_to_drop_xy / 0.10)
                 if obj_to_drop_xy < 0.08 and grip < 0.2:
-                    reward += 20.0
+                    reward += 50.0
             else:
                 reward -= 20.0
 
@@ -481,7 +520,7 @@ class URDualArmEnv(gym.Env):
 
             if obj_to_drop_xy < 0.08 and grip < 0.1 and obj[2] < init_obj[2] + 0.015:
                 self._grasped[i] = False
-                reward += 1000.0
+                reward += 1500.0
                 terminated_arm = True
 
         reward -= joint_vel_penalty
@@ -492,10 +531,19 @@ class URDualArmEnv(gym.Env):
 
         for i in range(self._n_arms):
             start = i * 7
-            self.data.ctrl[start:start + self._n_arm] = action[start:start + self._n_arm] * 0.5
+            arm_action = np.asarray(action[start:start + self._n_arm], dtype=np.float64)
+            arm_target = self.arm_cfg[i]["ready_pose"] + arm_action * ARM_ACTION_SCALE
+            arm_ctrlrange = self.model.actuator_ctrlrange[start:start + self._n_arm]
+            self.data.ctrl[start:start + self._n_arm] = np.clip(
+                arm_target,
+                arm_ctrlrange[:, 0],
+                arm_ctrlrange[:, 1],
+            )
             grip_idx = start + self._n_arm
             if grip_idx < self.model.nu:
-                self.data.ctrl[grip_idx] = (action[grip_idx] + 1.0) / 2.0 * 0.8
+                grip_low, grip_high = self.model.actuator_ctrlrange[grip_idx]
+                grip_command = (float(action[grip_idx]) + 1.0) / 2.0
+                self.data.ctrl[grip_idx] = grip_low + grip_command * (grip_high - grip_low)
 
         for _ in range(5):
             mujoco.mj_step(self.model, self.data)
@@ -511,11 +559,29 @@ class URDualArmEnv(gym.Env):
                 all_done = False
 
             obj = self.data.xpos[self._obj_ids[i]].copy()
+            ee = self.data.site_xpos[self._ee_sites[i]].copy()
+            qpos_adr = self._arm_qpos_adr[i]
+            object_reset = self._object_out_of_bounds(i, obj)
+            if object_reset:
+                total_reward -= OBJECT_RESET_PENALTY
+                reward -= OBJECT_RESET_PENALTY
+                self._reset_object_to_table(i)
+                obj = self.data.xpos[self._obj_ids[i]].copy()
+                phase = self._phase[i]
+                carrying = False
+                both_contacts = False
             info[f"{name}_phase"] = phase
             info[f"{name}_done"] = arm_done
+            info[f"{name}_reward"] = float(reward)
+            info[f"{name}_object_reset"] = object_reset
             info[f"{name}_carrying"] = carrying
             info[f"{name}_both_contacts"] = both_contacts
             info[f"{name}_grasp_streak"] = self._grasp_streak[i]
+            info[f"{name}_ee_pos"] = ee.astype(float).round(4).tolist()
+            info[f"{name}_obj_pos"] = obj.astype(float).round(4).tolist()
+            info[f"{name}_drop_pos"] = self._drop_positions[i].astype(float).round(4).tolist()
+            info[f"{name}_gripper_qpos"] = float(self.data.qpos[self._grip_qpos_adr[i]])
+            info[f"{name}_arm_qpos"] = self.data.qpos[qpos_adr:qpos_adr + self._n_arm].astype(float).round(4).tolist()
             info[f"{name}_obj_height"] = float(obj[2])
             info[f"{name}_obj_to_drop"] = float(np.linalg.norm(obj[:2] - self._drop_positions[i][:2]))
 
