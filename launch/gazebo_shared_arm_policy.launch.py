@@ -2,18 +2,23 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, TimerAction
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
-    gazebo_launch_path = LaunchConfiguration("gazebo_launch_path")
     world_file = LaunchConfiguration("world_file")
     robot_name = LaunchConfiguration("robot_name")
     ur_type = LaunchConfiguration("ur_type")
     use_sim_time = LaunchConfiguration("use_sim_time")
     launch_policy = LaunchConfiguration("launch_policy")
     policy_delay = LaunchConfiguration("policy_delay")
+
+    default_gazebo_launch = PathJoinSubstitution(
+        [FindPackageShare("ur_gazebo"), "launch", "ur.gazebo.launch.py"]
+    )
+    gazebo_launch_path = LaunchConfiguration("gazebo_launch_path", default=default_gazebo_launch)
 
     gazebo = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(gazebo_launch_path),
@@ -65,7 +70,8 @@ def generate_launch_description():
         [
             DeclareLaunchArgument(
                 "gazebo_launch_path",
-                description="Path to the UR Gazebo launch file to include (e.g. /path/to/UR3_ROS2_PICK_AND_PLACE/ur_gazebo/launch/ur.gazebo.launch.py).",
+                default_value=default_gazebo_launch,
+                description="Path to the UR Gazebo launch file. Defaults to the bundled ur_gazebo package.",
             ),
             DeclareLaunchArgument("world_file", default_value="colored_blocks.world"),
             DeclareLaunchArgument("robot_name", default_value="ur"),

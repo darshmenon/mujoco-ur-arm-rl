@@ -154,17 +154,22 @@ ros2 run mujoco_ur_rl_ros2 shared_arm_policy_node --ros-args \
   -p drop_x:=-1.25 -p drop_y:=0.0 -p drop_z:=0.02
 ```
 
-Launch Gazebo plus the shared policy:
+Launch Gazebo plus the shared policy (uses the bundled `ur_gazebo` package by default):
 
 ```bash
 ros2 launch mujoco_ur_rl_ros2 gazebo_shared_arm_policy.launch.py \
-  gazebo_launch_path:=/path/to/UR3_ROS2_PICK_AND_PLACE/ur_gazebo/launch/ur.gazebo.launch.py \
   model_path:=/path/to/mujoco-ur-arm-rl/models/shared_arm/<run_name>/best_model.zip \
-  arm_trajectory_topic:=/scaled_joint_trajectory_controller/joint_trajectory \
-  gripper_trajectory_topic:=/gripper_controller/joint_trajectory \
   ee_x:=0.0 ee_y:=0.0 ee_z:=0.0 \
   object_x:=-1.18 object_y:=0.0 object_z:=0.045 \
   drop_x:=-1.25 drop_y:=0.0 drop_z:=0.02
+```
+
+Override `gazebo_launch_path` if you want to use a different Gazebo stack:
+
+```bash
+ros2 launch mujoco_ur_rl_ros2 gazebo_shared_arm_policy.launch.py \
+  gazebo_launch_path:=/path/to/ur_gazebo/launch/ur.gazebo.launch.py \
+  model_path:=/path/to/mujoco-ur-arm-rl/models/shared_arm/<run_name>/best_model.zip
 ```
 
 Gazebo notes:
