@@ -5,6 +5,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import mujoco.viewer
 import numpy as np
 from stable_baselines3 import SAC
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback, EvalCallback
@@ -45,6 +46,7 @@ def parse_args():
     parser.add_argument("--curriculum", choices=["none", "easy_grasp"], default="easy_grasp")
     parser.add_argument("--resume-model", type=str, default=None, help="Optional shared-arm SAC model zip to resume.")
     parser.add_argument("--run-name", type=str, default=None)
+    parser.add_argument("--viewer", action="store_true", help="Launch the MuJoCo passive viewer on the first scene.")
     return parser.parse_args()
 
 
@@ -80,6 +82,28 @@ def json_safe(value):
     if isinstance(value, np.generic):
         return value.item()
     return value
+
+
+class ViewerCallback(BaseCallback):
+    def __init__(self, env, render_every=20):
+        super().__init__()
+        self._env = env
+        self._render_every = render_every
+        self._viewer = None
+
+    def _on_training_start(self):
+        first_scene = self._env.envs[0] if hasattr(self._env, "envs") else self._env
+        self._viewer = mujoco.viewer.launch_passive(first_scene.model, first_scene.data)
+
+    def _on_step(self):
+        if self._viewer is not None and self.n_calls % self._render_every == 0:
+            self._viewer.sync()
+        return True
+
+    def _on_training_end(self):
+        if self._viewer is not None:
+            self._viewer.close()
+            self._viewer = None
 
 
 class StatusCallback(BaseCallback):
@@ -218,17 +242,18 @@ def main():
         deterministic=True,
     )
 
-    callbacks = CallbackList(
-        [
-            eval_callback,
-            CheckpointCallback(
-                save_freq=callback_freq(args.checkpoint_freq, effective_envs),
-                save_path=checkpoints_dir,
-                name_prefix="shared_arm",
-            ),
-            StatusCallback(run_dir, args.status_freq, eval_callback=eval_callback),
-        ]
-    )
+    callback_list = [
+        eval_callback,
+        CheckpointCallback(
+            save_freq=callback_freq(args.checkpoint_freq, effective_envs),
+            save_path=checkpoints_dir,
+            name_prefix="shared_arm",
+        ),
+        StatusCallback(run_dir, args.status_freq, eval_callback=eval_callback),
+    ]
+    if args.viewer:
+        callback_list.append(ViewerCallback(vec_env))
+    callbacks = CallbackList(callback_list)
 
     print(
         f"Training shared 1-arm SAC policy in a {args.arms}-arm scene with "

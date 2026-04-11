@@ -11,7 +11,7 @@ Y_SPACING = 1.0
 GRASP_LIFT_THRESHOLD = 0.015
 CARRY_HEIGHT_THRESHOLD = 0.03
 GRASP_CLOSE_THRESHOLD = 0.35
-GRASP_STREAK_STEPS = 3
+GRASP_STREAK_STEPS = 1
 STEP_PENALTY = 0.01
 OBJECT_RESET_X_MARGIN = 0.25
 OBJECT_RESET_Y_MARGIN = 0.25
@@ -425,7 +425,7 @@ class URDualArmEnv(gym.Env):
 
             if ee_to_obj < 0.15:
                 reward += 12.0 * (1.0 - ee_to_obj / 0.15)
-            if grip > 0.45:
+            if grip > 0.45 and ee_to_obj > 0.15:
                 reward -= 2.0
             if ee_to_obj < 0.08:
                 self._phase[i] = 1
@@ -451,8 +451,10 @@ class URDualArmEnv(gym.Env):
             if grip < 0.15 and ee_to_obj < 0.05:
                 reward -= 4.0
 
-            if grip > GRASP_CLOSE_THRESHOLD and both_contacts:
+            if grip > GRASP_CLOSE_THRESHOLD and any_contact:
                 reward += max(0.0, obj_lift) * 900.0
+                if both_contacts:
+                    reward += 20.0
                 if obj_lift > GRASP_LIFT_THRESHOLD:
                     reward += 35.0
                     self._grasp_streak[i] += 1
