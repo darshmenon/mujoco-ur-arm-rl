@@ -23,6 +23,7 @@ REACH_DELTA_GAIN = 360.0
 GRASP_DELTA_GAIN = 320.0
 LIFT_DELTA_GAIN = 360.0
 CARRY_DELTA_GAIN = 240.0
+REWARD_SCALE = 100.0
 ARM_ACTION_SCALE = np.array([2.0, 1.8, 2.0, 1.8, 1.6, 1.6], dtype=np.float64)
 CURRICULUM_MODES = {"none", "easy_grasp"}
 
@@ -252,6 +253,13 @@ class URDualArmEnv(gym.Env):
         ]
         self._drop_positions = [np.array(cfg["drop_pos"], dtype=np.float64) for cfg in self.arm_cfg]
         self._obj_init_pos = [np.array(cfg["obj_pos"], dtype=np.float64) for cfg in self.arm_cfg]
+        self._arm_base_pos = [np.array(cfg["base_pos"], dtype=np.float64) for cfg in self.arm_cfg]
+        self._arm_rot_inv = []
+        for cfg in self.arm_cfg:
+            theta = np.deg2rad(cfg["euler_z"])
+            c, s = np.cos(theta), np.sin(theta)
+            # R_z(theta)^T — transforms world vectors into the arm's local frame
+            self._arm_rot_inv.append(np.array([[c, s, 0], [-s, c, 0], [0, 0, 1]], dtype=np.float64))
         self._obj_qpos_adr = [
             self.model.jnt_qposadr[
                 mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, f"obj_{name}_joint")
@@ -276,6 +284,10 @@ class URDualArmEnv(gym.Env):
         self._grasp_streak = [0] * self._n_arms
         self._episode_steps = 0
         self.max_episode_steps = 500 * self._n_arms
+
+    def _to_local(self, world_pos, i):
+        """Transform a world-space 3-vector into arm i's local frame."""
+        return self._arm_rot_inv[i] @ (world_pos - self._arm_base_pos[i])
 
     def _reset_object_pos(self, i):
         base_pos = self._obj_init_pos[i].copy()
@@ -325,9 +337,9 @@ class URDualArmEnv(gym.Env):
             qvel_adr = self._arm_qvel_adr[i]
             parts.append(self.data.qpos[qpos_adr:qpos_adr + self._n_arm].astype(np.float32))
             parts.append(self.data.qvel[qvel_adr:qvel_adr + self._n_arm].astype(np.float32))
-            parts.append(self.data.site_xpos[self._ee_sites[i]].astype(np.float32))
-            parts.append(self.data.xpos[self._obj_ids[i]].astype(np.float32))
-            parts.append(self._drop_positions[i].astype(np.float32))
+            parts.append(self._to_local(self.data.site_xpos[self._ee_sites[i]], i).astype(np.float32))
+            parts.append(self._to_local(self.data.xpos[self._obj_ids[i]], i).astype(np.float32))
+            parts.append(self._to_local(self._drop_positions[i], i).astype(np.float32))
             parts.append(np.array([self.data.qpos[self._grip_qpos_adr[i]]], dtype=np.float32))
             parts.append(np.array([float(self._phase[i])], dtype=np.float32))
         return np.concatenate(parts)
@@ -526,7 +538,7 @@ class URDualArmEnv(gym.Env):
                 terminated_arm = True
 
         reward -= joint_vel_penalty
-        return reward, terminated_arm, phase, carrying, both_contacts
+        return reward / REWARD_SCALE, terminated_arm, phase, carrying, both_contacts
 
     def step(self, action):
         self._episode_steps += 1
