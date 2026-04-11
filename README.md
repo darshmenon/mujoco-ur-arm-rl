@@ -77,12 +77,19 @@ python3 scripts/train/train_shared_arm.py --arms 8 --n-envs 4 --device cuda
 # Faster shared-policy mode: every arm in each scene contributes a sample each step
 python3 scripts/train/train_shared_arm.py --arms 8 --n-envs 2 --all-arms-samples --device cuda
 
+# Resume the latest shared-arm run from its newest checkpoint
+python3 scripts/train/train_shared_arm.py \
+  --arms 8 --n-envs 2 --all-arms-samples --device cuda \
+  --resume-model models/shared_arm/shared_arm_8arm_all_samples_resume_20260410_1501/checkpoints/shared_arm_79952_steps.zip \
+  --run-name shared_arm_resume_$(date +%Y%m%d_%H%M%S)
+
 # Apply that one shared arm policy to every arm in a 4-arm or 8-arm scene
 python3 scripts/train/play_shared_arm.py --model models/shared_arm/<run_name>/best_model.zip --arms 8 --viewer --deterministic
 ```
 
 Best multi-arm models and checkpoints are saved under `models/multi_arm/`, run logs under `logs/multi_arm/`.
 Shared one-arm policy runs use `models/shared_arm/` and `logs/shared_arm/`.
+The current default shared-arm ROS/Gazebo model path points at `models/shared_arm/shared_arm_8arm_all_samples_resume_20260410_1501/best_model.zip`.
 
 ## Monitor Progress
 
@@ -135,10 +142,43 @@ ros2 launch mujoco_ur_rl_ros2 ur_policy.launch.py \
   model_path:=/home/asimov/mujoco-ur-arm-rl/models/best_model.zip
 ```
 
+Run the shared-arm policy node directly:
+
+```bash
+ros2 run mujoco_ur_rl_ros2 shared_arm_policy_node --ros-args \
+  -p model_path:=/home/asimov/mujoco-ur-arm-rl/models/shared_arm/shared_arm_8arm_all_samples_resume_20260410_1501/best_model.zip \
+  -p arm_trajectory_topic:=/scaled_joint_trajectory_controller/joint_trajectory \
+  -p gripper_trajectory_topic:=/gripper_controller/joint_trajectory \
+  -p ee_x:=0.0 -p ee_y:=0.0 -p ee_z:=0.0 \
+  -p object_x:=-1.18 -p object_y:=0.0 -p object_z:=0.045 \
+  -p drop_x:=-1.25 -p drop_y:=0.0 -p drop_z:=0.02
+```
+
+Launch Gazebo plus the shared policy:
+
+```bash
+ros2 launch mujoco_ur_rl_ros2 gazebo_shared_arm_policy.launch.py \
+  gazebo_launch_path:=/home/asimov/UR3_ROS2_PICK_AND_PLACE/ur_gazebo/launch/ur.gazebo.launch.py \
+  model_path:=/home/asimov/mujoco-ur-arm-rl/models/shared_arm/shared_arm_8arm_all_samples_resume_20260410_1501/best_model.zip \
+  arm_trajectory_topic:=/scaled_joint_trajectory_controller/joint_trajectory \
+  gripper_trajectory_topic:=/gripper_controller/joint_trajectory \
+  ee_x:=0.0 ee_y:=0.0 ee_z:=0.0 \
+  object_x:=-1.18 object_y:=0.0 object_z:=0.045 \
+  drop_x:=-1.25 drop_y:=0.0 drop_z:=0.02
+```
+
+Gazebo notes:
+- `shared_arm_policy_node` is now exported as a ROS2 executable, so `ros2 run` and `ros2 launch` can both find it after rebuilding the package.
+- The shared-arm node defaults to `/scaled_joint_trajectory_controller/joint_trajectory`, which is the common UR controller topic in Gazebo setups.
+- Override `arm_joint_names` or `gripper_joint_names` if your Gazebo stack uses different joint names or a multi-joint gripper controller.
+- The shared policy does not infer object or drop poses from Gazebo yet; set `ee_*`, `object_*`, `drop_*`, and `phase` to match the scene you launch.
+
 ROS2 files added in this repo:
 - `package.xml`, `setup.py`, `setup.cfg`
 - `mujoco_ur_rl_ros2/ur_policy_node.py`
+- `mujoco_ur_rl_ros2/shared_arm_policy_node.py`
 - `launch/ur_policy.launch.py`
+- `launch/gazebo_shared_arm_policy.launch.py`
 - `ros2/ur_policy_node.py` remains as a compatibility wrapper
 
 ## Visualize

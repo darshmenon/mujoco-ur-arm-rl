@@ -25,6 +25,7 @@ setup(
     entry_points={
         "console_scripts": [
             "ur_policy_node = mujoco_ur_rl_ros2.ur_policy_node:main",
+            "shared_arm_policy_node = mujoco_ur_rl_ros2.shared_arm_policy_node:main",
         ],
     },
 )

@@ -18,13 +18,24 @@ ARM_JOINTS = [
 ]
 GRIPPER_JOINT = "finger_joint"
 
-DEFAULT_MODEL_PATH = str(
-    Path(__file__).resolve().parents[1]
-    / "models"
+DEFAULT_MODEL_RELATIVE_PATH = (
+    Path("models")
     / "shared_arm"
-    / "shared_arm_8arm_all_samples_gpu_20260410_1441"
+    / "shared_arm_8arm_all_samples_resume_20260410_1501"
     / "best_model.zip"
 )
+
+
+def resolve_default_model_path():
+    module_path = Path(__file__).resolve()
+    for parent in module_path.parents:
+        candidate = parent / DEFAULT_MODEL_RELATIVE_PATH
+        if candidate.exists():
+            return str(candidate)
+    return str(module_path.parents[1] / DEFAULT_MODEL_RELATIVE_PATH)
+
+
+DEFAULT_MODEL_PATH = resolve_default_model_path()
 
 
 class SharedArmPolicyNode(Node):
@@ -33,8 +44,13 @@ class SharedArmPolicyNode(Node):
 
         self.declare_parameter("model_path", DEFAULT_MODEL_PATH)
         self.declare_parameter("joint_state_topic", "/joint_states")
-        self.declare_parameter("arm_trajectory_topic", "/arm_controller/joint_trajectory")
+        self.declare_parameter(
+            "arm_trajectory_topic",
+            "/scaled_joint_trajectory_controller/joint_trajectory",
+        )
         self.declare_parameter("gripper_trajectory_topic", "/gripper_controller/joint_trajectory")
+        self.declare_parameter("arm_joint_names", ARM_JOINTS)
+        self.declare_parameter("gripper_joint_names", [GRIPPER_JOINT])
         self.declare_parameter("control_rate_hz", 10.0)
         self.declare_parameter("action_scale", 0.2)
         self.declare_parameter("gripper_scale", 0.02)
@@ -53,15 +69,22 @@ class SharedArmPolicyNode(Node):
         self.declare_parameter("phase", 0.0)
 
         model_path = str(self.get_parameter("model_path").value)
+        self._arm_joint_names = [str(name) for name in self.get_parameter("arm_joint_names").value]
+        self._gripper_joint_names = [str(name) for name in self.get_parameter("gripper_joint_names").value]
         self._action_scale = float(self.get_parameter("action_scale").value)
         self._gripper_scale = float(self.get_parameter("gripper_scale").value)
         self._step_dt = float(self.get_parameter("step_dt").value)
         self._publish_gripper = bool(self.get_parameter("publish_gripper").value)
+        self._warned_missing_arm_joints = set()
+        self._warned_missing_gripper_joints = set()
 
-        self.qpos = np.zeros(6, dtype=np.float32)
-        self.qvel = np.zeros(6, dtype=np.float32)
+        if len(self._arm_joint_names) != 6:
+            raise ValueError("arm_joint_names must contain exactly 6 joints for the shared-arm policy.")
+
+        self.qpos = np.zeros(len(self._arm_joint_names), dtype=np.float32)
+        self.qvel = np.zeros(len(self._arm_joint_names), dtype=np.float32)
         self.gripper_qpos = np.float32(0.0)
-        self._prev_pos = np.zeros(6, dtype=np.float32)
+        self._prev_pos = np.zeros(len(self._arm_joint_names), dtype=np.float32)
         self._prev_time = None
         self._have_joint_state = False
 
@@ -83,8 +106,11 @@ class SharedArmPolicyNode(Node):
         name_to_idx = {name: idx for idx, name in enumerate(msg.name)}
         now = self.get_clock().now().nanoseconds * 1e-9
 
-        for joint_idx, joint_name in enumerate(ARM_JOINTS):
+        for joint_idx, joint_name in enumerate(self._arm_joint_names):
             if joint_name not in name_to_idx:
+                if joint_name not in self._warned_missing_arm_joints:
+                    self.get_logger().warning(f"Joint state is missing arm joint '{joint_name}'")
+                    self._warned_missing_arm_joints.add(joint_name)
                 continue
             msg_idx = name_to_idx[joint_name]
             pos = np.float32(msg.position[msg_idx])
@@ -93,8 +119,15 @@ class SharedArmPolicyNode(Node):
                 self.qvel[joint_idx] = (pos - self._prev_pos[joint_idx]) / (now - self._prev_time)
             self._prev_pos[joint_idx] = pos
 
-        if GRIPPER_JOINT in name_to_idx:
-            self.gripper_qpos = np.float32(msg.position[name_to_idx[GRIPPER_JOINT]])
+        for joint_name in self._gripper_joint_names:
+            if joint_name in name_to_idx:
+                self.gripper_qpos = np.float32(msg.position[name_to_idx[joint_name]])
+                break
+        else:
+            for joint_name in self._gripper_joint_names:
+                if joint_name not in self._warned_missing_gripper_joints:
+                    self.get_logger().warning(f"Joint state is missing gripper joint '{joint_name}'")
+                    self._warned_missing_gripper_joints.add(joint_name)
 
         self._prev_time = now
         self._have_joint_state = True
@@ -146,7 +179,7 @@ class SharedArmPolicyNode(Node):
     def _publish_arm(self, positions):
         msg = JointTrajectory()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.joint_names = ARM_JOINTS
+        msg.joint_names = self._arm_joint_names
         point = JointTrajectoryPoint()
         point.positions = [float(value) for value in positions]
         point.time_from_start = self._duration()
@@ -156,9 +189,9 @@ class SharedArmPolicyNode(Node):
     def _publish_gripper_target(self, position):
         msg = JointTrajectory()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.joint_names = [GRIPPER_JOINT]
+        msg.joint_names = self._gripper_joint_names
         point = JointTrajectoryPoint()
-        point.positions = [position]
+        point.positions = [position for _ in self._gripper_joint_names]
         point.time_from_start = self._duration()
         msg.points = [point]
         self._gripper_pub.publish(msg)
