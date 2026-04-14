@@ -7,13 +7,25 @@ __pycache__/
 venv/
 .venv/
 logs/
-models/
 runs/
 build/
 install/
 log/
 .codex
 *.egg-info/
+# Ignore all zip files except explicitly tracked ones
 *.zip
+!models/shared_arm/shared_arm_8arm_all_samples_resume_20260410_1501/best_model.zip
+!models/best_model.zip
+
+# Ignore heavy ML models, but allow the main project ones
+models/*
+!models/best_model.zip
+!models/shared_arm/
+models/shared_arm/*
+!models/shared_arm/shared_arm_8arm_all_samples_resume_20260410_1501/
+models/shared_arm/shared_arm_8arm_all_samples_resume_20260410_1501/*
+!models/shared_arm/shared_arm_8arm_all_samples_resume_20260410_1501/best_model.zip
+
 *.pt
 *.pth

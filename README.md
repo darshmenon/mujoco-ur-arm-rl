@@ -89,7 +89,7 @@ python3 scripts/train/play_shared_arm.py --model models/shared_arm/<run_name>/be
 
 Best multi-arm models and checkpoints are saved under `models/multi_arm/`, run logs under `logs/multi_arm/`.
 Shared one-arm policy runs use `models/shared_arm/` and `logs/shared_arm/`.
-The current default shared-arm ROS/Gazebo model path points at `models/shared_arm/shared_arm_8arm_all_samples_resume_20260410_1501/best_model.zip`.
+The best trained `.zip` RL models are committed to the repository. The default ROS/Gazebo nodes automatically read `models/shared_arm/shared_arm_8arm_all_samples_resume_20260410_1501/best_model.zip` and `models/best_model.zip`, so they work out-of-the-box after cloning.
 
 ## Monitor Progress
 
