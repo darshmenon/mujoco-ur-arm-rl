@@ -93,7 +93,7 @@ def main():
             gamma=0.99,
             tau=0.005,
             ent_coef="auto",
-            target_entropy=-7.0,   # half of action dim (7)
+            target_entropy=-14.0,  # full action dim keeps exploration alive longer
             learning_starts=10_000,
             train_freq=4,
             gradient_steps=4,

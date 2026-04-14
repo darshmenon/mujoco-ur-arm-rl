@@ -103,7 +103,11 @@ class URGazeboSingleArmEnv(gym.Env):
         self._ee_site_id   = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE,  "attachment_site")
         self._obj_body_id  = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY,  "object")
         self._drop_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY,  "drop_zone")
-        self._grip_qpos_start = N_ARM   # gripper qpos index (after arm joints)
+        self._grip_qpos_start = N_ARM   # qpos[6] = right_driver_joint (main actuated gripper joint)
+        # Robotiq 2F-85 has 8 gripper qpos slots (6 arm + 8 gripper = 14) then freejoint
+        self._obj_qpos_start  = self.model.jnt_qposadr[
+            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "object_joint")
+        ]
 
         # obs/act spaces
         self.observation_space = spaces.Box(-np.inf, np.inf, shape=(23,), dtype=np.float32)
@@ -146,9 +150,9 @@ class URGazeboSingleArmEnv(gym.Env):
         # randomise object
         ox = self.np_random.uniform(*OBJ_X_RANGE)
         oy = self.np_random.uniform(*OBJ_Y_RANGE)
-        obj_start = N_ARM + 1   # after arm qpos + gripper qpos
-        self.data.qpos[obj_start:obj_start+3]   = [ox, oy, OBJ_Z]
-        self.data.qpos[obj_start+3:obj_start+7] = [1, 0, 0, 0]
+        s = self._obj_qpos_start
+        self.data.qpos[s:s+3]   = [ox, oy, OBJ_Z]
+        self.data.qpos[s+3:s+7] = [1, 0, 0, 0]
 
         # randomise drop zone
         dx = self.np_random.uniform(*DROP_X_RANGE)
