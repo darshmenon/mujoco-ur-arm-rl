@@ -8,7 +8,7 @@ TABLE_Z = 0.02
 OBJECT_Z = 0.045
 LIFT_Z = 0.10
 Y_SPACING = 1.0
-GRASP_LIFT_THRESHOLD = 0.015
+GRASP_LIFT_THRESHOLD = 0.005
 CARRY_HEIGHT_THRESHOLD = 0.02
 GRASP_CLOSE_THRESHOLD = 0.28
 GRASP_STREAK_STEPS = 1
@@ -494,6 +494,7 @@ class URDualArmEnv(gym.Env):
                 reward += max(0.0, obj_lift) * 1300.0
                 if both_contacts:
                     reward += 36.0
+                    reward += (grip - GRASP_CLOSE_THRESHOLD) * 60.0
                 if obj_lift > GRASP_LIFT_THRESHOLD:
                     reward += 75.0
                     self._grasp_streak[i] += 1

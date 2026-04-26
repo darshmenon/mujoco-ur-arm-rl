@@ -25,13 +25,14 @@ N_CTRL = N_ARM + N_GRIP
 READY_POSE     = np.array([0.0,   -1.0,  1.5,   -1.57, -1.57, 0.0], dtype=np.float64)
 # pre-computed via IK: EE at [0.35, 0, 0.15] — above the object workspace
 GRASP_POSE     = np.array([0.492, -1.63, 3.668, -1.911, -1.254, 0.0], dtype=np.float64)
-ARM_ACT_SCALE  = np.array([2.0, 1.8, 2.0, 1.8, 1.6, 1.6],      dtype=np.float64)
+# delta per env step — matches shared_arm_policy_node (action_scale=1.0, step_dt=0.1)
+ARM_DELTA_SCALE = 0.1   # rad per step per unit action
 
-OBJ_X_RANGE  = (0.28, 0.45)
+OBJ_X_RANGE  = (0.22, 0.38)
 OBJ_Y_RANGE  = (-0.15, 0.15)
 OBJ_Z        = 0.045
-DROP_X_RANGE = (0.28, 0.45)
-DROP_Y_RANGE = (0.15, 0.28)
+DROP_X_RANGE = (0.30, 0.40)
+DROP_Y_RANGE = (0.15, 0.25)
 DROP_Z       = 0.025
 LIFT_Z       = 0.10
 
@@ -43,7 +44,7 @@ LIFT_DELTA_GAIN        = 420.0
 CARRY_DELTA_GAIN       = 280.0
 REWARD_SCALE           = 100.0
 GRASP_CLOSE_THRESHOLD  = 0.28
-GRASP_LIFT_THRESHOLD   = 0.015
+GRASP_LIFT_THRESHOLD   = 0.005
 CARRY_HEIGHT_THRESHOLD = 0.02
 GRASP_STREAK_STEPS     = 1
 OBJECT_RESET_PENALTY   = 250.0
@@ -181,15 +182,15 @@ class URGazeboSingleArmEnv(gym.Env):
 
     # ── step ─────────────────────────────────────────────────────────────
     def step(self, action):
-        # arm: position target relative to ready pose
-        arm_target = READY_POSE + np.asarray(action[:N_ARM], dtype=np.float64) * ARM_ACT_SCALE
+        # arm: delta from current position — matches shared_arm_policy_node semantics
+        arm_target = self.data.qpos[:N_ARM] + np.asarray(action[:N_ARM], dtype=np.float64) * ARM_DELTA_SCALE
         arm_range  = self.model.actuator_ctrlrange[:N_ARM]
         self.data.ctrl[:N_ARM] = np.clip(arm_target, arm_range[:, 0], arm_range[:, 1])
 
-        # gripper: map [-1,1] → [low, high]
+        # gripper: delta from current position — matches shared_arm_policy_node semantics
+        grip_delta = float(action[N_ARM]) * 0.05   # ~50 steps to fully open/close
         gl, gh = self.model.actuator_ctrlrange[N_ARM]
-        grip_cmd = (float(action[N_ARM]) + 1.0) / 2.0
-        self.data.ctrl[N_ARM] = gl + grip_cmd * (gh - gl)
+        self.data.ctrl[N_ARM] = float(np.clip(self.data.ctrl[N_ARM] + grip_delta, gl, gh))
 
         for _ in range(5):
             mujoco.mj_step(self.model, self.data)
@@ -277,7 +278,9 @@ class URGazeboSingleArmEnv(gym.Env):
             if grip < 0.15 and ee_to_obj < 0.05: reward -= 4.0
             if grip > GRASP_CLOSE_THRESHOLD and any_c:
                 reward += max(0.0, obj_lift) * 1300.0
-                if both_c: reward += 36.0
+                if both_c:
+                    reward += 36.0
+                    reward += (grip - GRASP_CLOSE_THRESHOLD) * 60.0
                 if obj_lift > GRASP_LIFT_THRESHOLD:
                     reward += 75.0
                     self._grasp_streak += 1

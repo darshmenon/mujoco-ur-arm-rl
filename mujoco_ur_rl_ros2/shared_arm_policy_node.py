@@ -2,6 +2,7 @@ from pathlib import Path
 
 import numpy as np
 import rclpy
+import tf2_ros
 from builtin_interfaces.msg import Duration
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
@@ -46,7 +47,7 @@ class SharedArmPolicyNode(Node):
         self.declare_parameter("joint_state_topic", "/joint_states")
         self.declare_parameter(
             "arm_trajectory_topic",
-            "/scaled_joint_trajectory_controller/joint_trajectory",
+            "/arm_controller/joint_trajectory",
         )
         self.declare_parameter("gripper_trajectory_topic", "/gripper_controller/joint_trajectory")
         self.declare_parameter("arm_joint_names", ARM_JOINTS)
@@ -57,15 +58,14 @@ class SharedArmPolicyNode(Node):
         self.declare_parameter("step_dt", 0.1)
         self.declare_parameter("publish_gripper", True)
 
-        self.declare_parameter("ee_x", 0.0)
-        self.declare_parameter("ee_y", 0.0)
-        self.declare_parameter("ee_z", 0.0)
-        self.declare_parameter("object_x", -1.18)
+        self.declare_parameter("base_frame", "base_link")
+        self.declare_parameter("ee_frame", "tool0")
+        self.declare_parameter("object_x", 0.35)
         self.declare_parameter("object_y", 0.0)
         self.declare_parameter("object_z", 0.045)
-        self.declare_parameter("drop_x", -1.25)
-        self.declare_parameter("drop_y", 0.0)
-        self.declare_parameter("drop_z", 0.02)
+        self.declare_parameter("drop_x", 0.35)
+        self.declare_parameter("drop_y", 0.20)
+        self.declare_parameter("drop_z", 0.025)
         self.declare_parameter("phase", 0.0)
 
         model_path = str(self.get_parameter("model_path").value) or DEFAULT_MODEL_PATH
@@ -96,6 +96,12 @@ class SharedArmPolicyNode(Node):
         arm_trajectory_topic = str(self.get_parameter("arm_trajectory_topic").value)
         gripper_trajectory_topic = str(self.get_parameter("gripper_trajectory_topic").value)
         control_rate_hz = float(self.get_parameter("control_rate_hz").value)
+
+        self._tf_buffer = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
+        self._base_frame = str(self.get_parameter("base_frame").value)
+        self._ee_frame = str(self.get_parameter("ee_frame").value)
+        self._ee_pos = np.zeros(3, dtype=np.float32)
 
         self.create_subscription(JointState, joint_state_topic, self._joint_cb, 10)
         self._arm_pub = self.create_publisher(JointTrajectory, arm_trajectory_topic, 10)
@@ -142,12 +148,26 @@ class SharedArmPolicyNode(Node):
             dtype=np.float32,
         )
 
+    def _ee_from_tf(self):
+        try:
+            t = self._tf_buffer.lookup_transform(
+                self._base_frame, self._ee_frame, rclpy.time.Time()
+            )
+            self._ee_pos = np.array([
+                t.transform.translation.x,
+                t.transform.translation.y,
+                t.transform.translation.z,
+            ], dtype=np.float32)
+        except Exception:
+            pass
+        return self._ee_pos
+
     def _obs(self):
         return np.concatenate(
             [
                 self.qpos,
                 self.qvel,
-                self._param_vec("ee"),
+                self._ee_from_tf(),
                 self._param_vec("object"),
                 self._param_vec("drop"),
                 np.array([self.gripper_qpos], dtype=np.float32),
