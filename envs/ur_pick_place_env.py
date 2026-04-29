@@ -130,7 +130,8 @@ class URPickPlaceEnv(gym.Env):
         # Map gripper: -1=open, +1=close
         gripper_ctrl_idx = self._n_arm_joints
         if gripper_ctrl_idx < self.model.nu:
-            self.data.ctrl[gripper_ctrl_idx] = (gripper_action + 1) / 2 * 0.8
+            gl, gh = self.model.actuator_ctrlrange[gripper_ctrl_idx]
+            self.data.ctrl[gripper_ctrl_idx] = gl + (gripper_action + 1) / 2 * (gh - gl)
 
         for _ in range(5):
             mujoco.mj_step(self.model, self.data)
