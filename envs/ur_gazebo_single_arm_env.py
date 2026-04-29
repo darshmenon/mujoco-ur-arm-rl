@@ -187,9 +187,9 @@ class URGazeboSingleArmEnv(gym.Env):
         arm_range  = self.model.actuator_ctrlrange[:N_ARM]
         self.data.ctrl[:N_ARM] = np.clip(arm_target, arm_range[:, 0], arm_range[:, 1])
 
-        # gripper: delta from current position — matches shared_arm_policy_node semantics
-        grip_delta = float(action[N_ARM]) * 0.05   # ~50 steps to fully open/close
+        # gripper: delta scaled to actuator range so full sweep takes ~20 steps
         gl, gh = self.model.actuator_ctrlrange[N_ARM]
+        grip_delta = float(action[N_ARM]) * ((gh - gl) / 20.0)
         self.data.ctrl[N_ARM] = float(np.clip(self.data.ctrl[N_ARM] + grip_delta, gl, gh))
 
         for _ in range(5):
