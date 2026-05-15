@@ -19,13 +19,18 @@ os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 
+_MENAGERIE  = os.environ.get("MUJOCO_MENAGERIE_PATH", os.path.expanduser("~/mujoco_menagerie"))
+_UR5E_XML   = os.path.join(_MENAGERIE, "universal_robots_ur5e", "ur5e.xml")
+_GRIPPER_XML = os.path.join(_MENAGERIE, "robotiq_2f85", "2f85.xml")
+
+
 def build_2arm_spec():
-    arm_l = mujoco.MjSpec.from_file("/home/asimov/mujoco_menagerie/universal_robots_ur5e/ur5e.xml")
-    grip_l = mujoco.MjSpec.from_file("/home/asimov/mujoco_menagerie/robotiq_2f85/2f85.xml")
+    arm_l = mujoco.MjSpec.from_file(_UR5E_XML)
+    grip_l = mujoco.MjSpec.from_file(_GRIPPER_XML)
     arm_l.sites[0].attach_body(grip_l.worldbody.first_body(), "l_gr-", "")
 
-    arm_r = mujoco.MjSpec.from_file("/home/asimov/mujoco_menagerie/universal_robots_ur5e/ur5e.xml")
-    grip_r = mujoco.MjSpec.from_file("/home/asimov/mujoco_menagerie/robotiq_2f85/2f85.xml")
+    arm_r = mujoco.MjSpec.from_file(_UR5E_XML)
+    grip_r = mujoco.MjSpec.from_file(_GRIPPER_XML)
     arm_r.sites[0].attach_body(grip_r.worldbody.first_body(), "r_gr-", "")
 
     spec = mujoco.MjSpec()

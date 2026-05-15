@@ -1,8 +1,16 @@
+import os
 import numpy as np
 import mujoco
 import mujoco.viewer
 import gymnasium as gym
 from gymnasium import spaces
+
+_MENAGERIE = os.environ.get(
+    "MUJOCO_MENAGERIE_PATH",
+    os.path.expanduser("~/mujoco_menagerie"),
+)
+_UR5E_XML   = os.path.join(_MENAGERIE, "universal_robots_ur5e", "ur5e.xml")
+_GRIPPER_XML = os.path.join(_MENAGERIE, "robotiq_2f85", "2f85.xml")
 
 
 class URReachEnv(gym.Env):
@@ -13,12 +21,8 @@ class URReachEnv(gym.Env):
     def __init__(self, render_mode=None):
         self.render_mode = render_mode
 
-        self._arm = mujoco.MjSpec.from_file(
-            "/home/asimov/mujoco_menagerie/universal_robots_ur5e/ur5e.xml"
-        )
-        self._gripper_spec = mujoco.MjSpec.from_file(
-            "/home/asimov/mujoco_menagerie/robotiq_2f85/2f85.xml"
-        )
+        self._arm = mujoco.MjSpec.from_file(_UR5E_XML)
+        self._gripper_spec = mujoco.MjSpec.from_file(_GRIPPER_XML)
         site = self._arm.sites[0]
         site.attach_body(self._gripper_spec.worldbody.first_body(), "gripper-", "")
 

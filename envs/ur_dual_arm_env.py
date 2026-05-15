@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import mujoco
 import mujoco.viewer
@@ -27,8 +28,9 @@ REWARD_SCALE = 100.0
 ARM_ACTION_SCALE = np.array([2.0, 1.8, 2.0, 1.8, 1.6, 1.6], dtype=np.float64)
 CURRICULUM_MODES = {"none", "easy_grasp", "grasp_focus"}
 
-ARM_MODEL_PATH = "/home/asimov/mujoco_menagerie/universal_robots_ur5e/ur5e.xml"
-GRIPPER_MODEL_PATH = "/home/asimov/mujoco_menagerie/robotiq_2f85/2f85.xml"
+_MENAGERIE       = os.environ.get("MUJOCO_MENAGERIE_PATH", os.path.expanduser("~/mujoco_menagerie"))
+ARM_MODEL_PATH    = os.path.join(_MENAGERIE, "universal_robots_ur5e", "ur5e.xml")
+GRIPPER_MODEL_PATH = os.path.join(_MENAGERIE, "robotiq_2f85", "2f85.xml")
 
 SIDE_CFG = {
     "left": {

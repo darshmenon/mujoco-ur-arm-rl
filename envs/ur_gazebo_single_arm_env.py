@@ -10,13 +10,15 @@ Obs (23-dim, matches shared_arm_policy_node):
 Actions (7-dim): 6 arm joint targets (relative to ready_pose) + 1 gripper
 """
 
+import os
 import mujoco
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
-ARM_MODEL_PATH    = "/home/asimov/mujoco_menagerie/universal_robots_ur5e/ur5e.xml"
-GRIPPER_MODEL_PATH = "/home/asimov/mujoco_menagerie/robotiq_2f85/2f85.xml"
+_MENAGERIE        = os.environ.get("MUJOCO_MENAGERIE_PATH", os.path.expanduser("~/mujoco_menagerie"))
+ARM_MODEL_PATH    = os.path.join(_MENAGERIE, "universal_robots_ur5e", "ur5e.xml")
+GRIPPER_MODEL_PATH = os.path.join(_MENAGERIE, "robotiq_2f85", "2f85.xml")
 
 N_ARM  = 6
 N_GRIP = 1
