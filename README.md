@@ -24,14 +24,56 @@ Reinforcement learning training environment for the Universal Robots UR5e arm us
 
 ![4-Arm Training](assets/4arm_training.png)
 
-Four or more UR5e arms with Robotiq 2F-85 grippers arranged symmetrically. Each arm gets its own table, object, and drop zone, and the layout can scale to 8 arms in the same pattern.
+Four or more UR5e arms with Robotiq 2F-85 grippers arranged symmetrically. Each arm gets its own table, object, and drop zone, and the layout scales to 8 arms in the same pattern.
 
-The current multi-arm reward is contact-gated: the policy is rewarded for approaching the object, but grasp/lift progress only counts once the object actually contacts both gripper sides and starts moving upward.
+The reward is contact-gated and phase-based (reach → grasp → lift → place). The policy is rewarded for approaching the object, but grasp/lift progress only counts once the object contacts both gripper sides and starts moving upward.
 
 ```bash
 python3 scripts/train/train_dual_arm_live.py --arms 4 --n-envs 4
-
 python3 scripts/train/train_dual_arm_live.py --arms 8 --n-envs 2
+```
+
+## Features
+
+### Domain Randomisation (`--domain-rand`)
+
+Randomises object mass (0.1–0.6 kg) and surface friction (0.5–3.0) every episode reset. Improves sim-to-real transfer by preventing the policy from overfitting to a single physical configuration.
+
+```bash
+python3 scripts/train/train_dual_arm_live.py --arms 4 --n-envs 4 --domain-rand
+```
+
+### Auto-Curriculum (`--curriculum auto`)
+
+Self-pacing difficulty scheduler. Starts objects spawned close to the arm (easy grasping), and gradually moves them toward the standard table position as the success rate rises above 70%. Backs off if success rate drops below 30%. Current difficulty is logged in `scene_summary.curriculum_difficulty` each step.
+
+```bash
+python3 scripts/train/train_dual_arm_live.py --arms 4 --n-envs 4 --curriculum auto
+```
+
+Other curriculum options: `easy_grasp` (fixed easy spawn), `grasp_focus` (object very close to EE, starts in phase 1).
+
+### Grasp Quality Reward
+
+Always active — no flag needed. When both gripper pads contact the object, a symmetry score is computed from the left/right contact force magnitudes. A perfectly centred grasp scores 1.0; a one-sided grasp scores 0.0. The bonus is applied in both the grasp phase and the lift phase, encouraging the policy to maintain a firm, centred grip throughout.
+
+### Handover Mode (`--handover`)
+
+Pairs each left arm with the opposite right arm. Left arms pick their object and carry it to a central handover table (x = 0). Once a left arm places its object there, the paired right arm activates (phase changes from −1 → 0), picks up the same object, and carries it to the right-side drop zone. Both arms must complete for the episode to terminate.
+
+```bash
+python3 scripts/train/train_dual_arm_live.py --arms 4 --n-envs 2 --handover
+```
+
+Combine flags freely:
+
+```bash
+python3 scripts/train/train_dual_arm_live.py \
+  --arms 4 --n-envs 4 \
+  --curriculum auto \
+  --domain-rand \
+  --handover \
+  --device cuda
 ```
 
 ## Setup
@@ -40,7 +82,7 @@ python3 scripts/train/train_dual_arm_live.py --arms 8 --n-envs 2
 pip install mujoco gymnasium stable-baselines3
 ```
 
-Clone [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) to `/home/asimov/mujoco_menagerie`.
+Clone [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) to `~/mujoco_menagerie` or set the `MUJOCO_MENAGERIE_PATH` environment variable.
 
 ## Project Layout
 
@@ -59,32 +101,37 @@ python3 scripts/train/train.py
 # Single arm pick-and-place
 python3 scripts/train/train_pick_place.py
 
-# Multi-arm training, headless by default
+# Multi-arm, headless
 python3 scripts/train/train_dual_arm_live.py --arms 4 --n-envs 4
 
 # Larger symmetric layout
 python3 scripts/train/train_dual_arm_live.py --arms 8 --n-envs 2
 
-# Same trainer, but with the MuJoCo viewer
+# With MuJoCo viewer
 python3 scripts/train/train_dual_arm_live.py --arms 4 --n-envs 2 --viewer
 
-# Use GPU when PyTorch CUDA is available
+# GPU
 python3 scripts/train/train_dual_arm_live.py --arms 4 --n-envs 4 --device cuda
 
-# Train one reusable 7-action arm policy in an 8-arm scene
-python3 scripts/train/train_shared_arm.py --arms 8 --n-envs 4 --device cuda
+# Domain randomisation + auto-curriculum
+python3 scripts/train/train_dual_arm_live.py --arms 4 --n-envs 4 --domain-rand --curriculum auto
 
-# Faster shared-policy mode: every arm in each scene contributes a sample each step
+# Handover task
+python3 scripts/train/train_dual_arm_live.py --arms 4 --n-envs 2 --handover
+
+# Shared single-arm policy (every arm contributes a sample per step)
 python3 scripts/train/train_shared_arm.py --arms 8 --n-envs 2 --all-arms-samples --device cuda
 
-# Resume the latest shared-arm run from its newest checkpoint
+# Resume a shared-arm run from its latest checkpoint
 python3 scripts/train/train_shared_arm.py \
   --arms 8 --n-envs 2 --all-arms-samples --device cuda \
   --resume-model models/shared_arm/shared_arm_8arm_all_samples_resume_20260410_1501/checkpoints/shared_arm_79952_steps.zip \
   --run-name shared_arm_resume_$(date +%Y%m%d_%H%M%S)
 
-# Apply that one shared arm policy to every arm in a 4-arm or 8-arm scene
-python3 scripts/train/play_shared_arm.py --model models/shared_arm/<run_name>/best_model.zip --arms 8 --viewer --deterministic
+# Play back a trained shared-arm policy
+python3 scripts/train/play_shared_arm.py \
+  --model models/shared_arm/<run_name>/best_model.zip \
+  --arms 8 --viewer --deterministic
 ```
 
 Best multi-arm models and checkpoints are saved under `models/multi_arm/`, run logs under `logs/multi_arm/`.
@@ -109,6 +156,7 @@ Useful signals:
 - `ep_rew_mean`: average training reward per finished episode
 - `eval_mean_reward`: evaluation reward from the latest eval pass
 - `fps`: simulation throughput
+- `env0_info.scene_summary.curriculum_difficulty`: current auto-curriculum difficulty (0 = easy, 1 = standard)
 
 ## ROS2 Package
 
@@ -173,18 +221,18 @@ ros2 launch mujoco_ur_rl_ros2 gazebo_shared_arm_policy.launch.py \
 ```
 
 Gazebo notes:
-- `shared_arm_policy_node` is now exported as a ROS2 executable, so `ros2 run` and `ros2 launch` can both find it after rebuilding the package.
-- The shared-arm node defaults to `/scaled_joint_trajectory_controller/joint_trajectory`, which is the common UR controller topic in Gazebo setups.
-- Override `arm_joint_names` or `gripper_joint_names` if your Gazebo stack uses different joint names or a multi-joint gripper controller.
-- The shared policy does not infer object or drop poses from Gazebo yet; set `ee_*`, `object_*`, `drop_*`, and `phase` to match the scene you launch.
+- `shared_arm_policy_node` is exported as a ROS2 executable, so `ros2 run` and `ros2 launch` can both find it after rebuilding.
+- The shared-arm node defaults to `/scaled_joint_trajectory_controller/joint_trajectory`.
+- Override `arm_joint_names` or `gripper_joint_names` if your Gazebo stack uses different joint names.
+- The shared policy does not infer object or drop poses from Gazebo; set `ee_*`, `object_*`, `drop_*`, and `phase` to match the scene.
 
-ROS2 files added in this repo:
+ROS2 files in this repo:
 - `package.xml`, `setup.py`, `setup.cfg`
 - `mujoco_ur_rl_ros2/ur_policy_node.py`
 - `mujoco_ur_rl_ros2/shared_arm_policy_node.py`
 - `launch/ur_policy.launch.py`
 - `launch/gazebo_shared_arm_policy.launch.py`
-- `ros2/ur_policy_node.py` remains as a compatibility wrapper
+- `ros2/ur_policy_node.py` (compatibility wrapper)
 
 ## Visualize
 
