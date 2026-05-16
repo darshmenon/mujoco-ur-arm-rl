@@ -1,4 +1,5 @@
 import os
+from collections import deque
 import numpy as np
 import mujoco
 import mujoco.viewer
@@ -26,7 +27,18 @@ LIFT_DELTA_GAIN = 420.0
 CARRY_DELTA_GAIN = 280.0
 REWARD_SCALE = 100.0
 ARM_ACTION_SCALE = np.array([2.0, 1.8, 2.0, 1.8, 1.6, 1.6], dtype=np.float64)
-CURRICULUM_MODES = {"none", "easy_grasp", "grasp_focus"}
+CURRICULUM_MODES = {"none", "easy_grasp", "grasp_focus", "auto"}
+
+DR_MASS_MIN, DR_MASS_MAX = 0.10, 0.60
+DR_FRICTION_MIN, DR_FRICTION_MAX = 0.5, 3.0
+DR_SPAWN_NOISE = 0.03
+
+AUTO_CURRICULUM_WINDOW = 100
+AUTO_CURRICULUM_INCREASE_THRESH = 0.70
+AUTO_CURRICULUM_DECREASE_THRESH = 0.30
+AUTO_CURRICULUM_STEP = 0.05
+
+HANDOVER_X = 0.0
 
 _MENAGERIE       = os.environ.get("MUJOCO_MENAGERIE_PATH", os.path.expanduser("~/mujoco_menagerie"))
 ARM_MODEL_PATH    = os.path.join(_MENAGERIE, "universal_robots_ur5e", "ur5e.xml")
@@ -97,18 +109,32 @@ def _build_arm_cfg(arm_count):
 
 class URDualArmEnv(gym.Env):
     """
-    Symmetric multi-arm UR5e task.
-    Each arm gets its own table, object, and drop zone.
+    Symmetric multi-arm UR5e pick-and-place.
+
+    Features:
+      domain_rand   — randomise object mass and friction each episode
+      curriculum_mode="auto" — self-pacing spawn difficulty driven by success rate
+      handover_mode — left arms drop at centre; right arms pick up and carry to final zone
+    Grasp quality (contact force symmetry) is always rewarded.
     """
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 50}
 
-    def __init__(self, render_mode=None, arm_count=4, curriculum_mode="none"):
+    def __init__(
+        self,
+        render_mode=None,
+        arm_count=4,
+        curriculum_mode="none",
+        domain_rand=False,
+        handover_mode=False,
+    ):
         if curriculum_mode not in CURRICULUM_MODES:
             raise ValueError(f"curriculum_mode must be one of {sorted(CURRICULUM_MODES)}")
 
         self.render_mode = render_mode
         self.curriculum_mode = curriculum_mode
+        self.domain_rand = domain_rand
+        self.handover_mode = handover_mode
         self.arm_cfg = _build_arm_cfg(arm_count)
 
         spec = mujoco.MjSpec()
@@ -159,7 +185,7 @@ class URDualArmEnv(gym.Env):
         for cfg in self.arm_cfg:
             attach_arm(cfg["name"], cfg["base_pos"], cfg["euler_z"])
 
-        for arm_idx, cfg in enumerate(self.arm_cfg):
+        for cfg in self.arm_cfg:
             table = spec.worldbody.add_body()
             table.name = f"table_{cfg['name']}"
             table.pos = [cfg["table_pos"][0], cfg["table_pos"][1], 0.0]
@@ -196,6 +222,18 @@ class URDualArmEnv(gym.Env):
             drop_geom.rgba = [0.1, 0.9, 0.1, 0.5]
             drop_geom.contype = 0
             drop_geom.conaffinity = 0
+
+        if handover_mode:
+            y_positions = _centered_y_positions(arm_count // 2)
+            for pair_i, y_pos in enumerate(y_positions):
+                ht = spec.worldbody.add_body()
+                ht.name = f"handover_table_{pair_i}"
+                ht.pos = [HANDOVER_X, y_pos, 0.0]
+                ht_geom = ht.add_geom()
+                ht_geom.name = f"handover_table_{pair_i}_geom"
+                ht_geom.type = mujoco.mjtGeom.mjGEOM_BOX
+                ht_geom.size = [0.15, 0.15, TABLE_Z]
+                ht_geom.rgba = [0.6, 0.4, 0.8, 1.0]
 
         self.model = spec.compile()
         self.data = mujoco.MjData(self.model)
@@ -260,7 +298,6 @@ class URDualArmEnv(gym.Env):
         for cfg in self.arm_cfg:
             theta = np.deg2rad(cfg["euler_z"])
             c, s = np.cos(theta), np.sin(theta)
-            # R_z(theta)^T — transforms world vectors into the arm's local frame
             self._arm_rot_inv.append(np.array([[c, s, 0], [-s, c, 0], [0, 0, 1]], dtype=np.float64))
         self._obj_qpos_adr = [
             self.model.jnt_qposadr[
@@ -275,6 +312,26 @@ class URDualArmEnv(gym.Env):
             for name in self.arm_names
         ]
 
+        # handover_mode: left arms are givers, right arms are receivers
+        # givers drop at central handover zone; receivers pick from there and carry to final drop
+        self._handover_giver_of = {}   # giver_i -> receiver_i
+        self._handover_pairs = {}      # receiver_i -> giver_i
+        if self.handover_mode:
+            n_per_side = self._n_arms // 2
+            for k in range(n_per_side):
+                giver_i = k
+                receiver_i = k + n_per_side
+                self._handover_giver_of[giver_i] = receiver_i
+                self._handover_pairs[receiver_i] = giver_i
+                # receiver tracks giver's object
+                self._obj_ids[receiver_i] = self._obj_ids[giver_i]
+                self._obj_geom_ids[receiver_i] = self._obj_geom_ids[giver_i]
+                self._obj_qpos_adr[receiver_i] = self._obj_qpos_adr[giver_i]
+                self._obj_qvel_adr[receiver_i] = self._obj_qvel_adr[giver_i]
+                # giver drops at central handover zone
+                handover_y = self.arm_cfg[giver_i]["base_pos"][1]
+                self._drop_positions[giver_i] = np.array([HANDOVER_X, handover_y, TABLE_Z])
+
         obs_dim = self._n_arms * 23
         self.observation_space = spaces.Box(-np.inf, np.inf, shape=(obs_dim,), dtype=np.float32)
         self.action_space = spaces.Box(-1.0, 1.0, shape=(self._n_ctrl,), dtype=np.float32)
@@ -284,11 +341,16 @@ class URDualArmEnv(gym.Env):
         self._prev_dist = [None] * self._n_arms
         self._grasped = [False] * self._n_arms
         self._grasp_streak = [0] * self._n_arms
+        self._arm_done = [False] * self._n_arms
+        self._handover_active = [True] * self._n_arms
         self._episode_steps = 0
         self.max_episode_steps = 500 * self._n_arms
 
+        # auto-curriculum state (persists across episodes)
+        self._difficulty = 0.0
+        self._success_history: deque = deque(maxlen=AUTO_CURRICULUM_WINDOW)
+
     def _to_local(self, world_pos, i):
-        """Transform a world-space 3-vector into arm i's local frame."""
         return self._arm_rot_inv[i] @ (world_pos - self._arm_base_pos[i])
 
     def _reset_object_pos(self, i):
@@ -303,22 +365,18 @@ class URDualArmEnv(gym.Env):
             x_jitter = float(self.np_random.uniform(-0.02, 0.02))
             y_jitter = float(self.np_random.uniform(-0.025, 0.025))
             return np.array(
-                [
-                    table_x - 0.24 + x_jitter,
-                    table_y - 0.13 + y_jitter,
-                    OBJECT_Z,
-                ],
+                [table_x - 0.24 + x_jitter, table_y - 0.13 + y_jitter, OBJECT_Z],
                 dtype=np.float64,
             )
 
-        return np.array(
-            [
-                table_x,
-                table_y,
-                OBJECT_Z,
-            ],
-            dtype=np.float64,
-        )
+        if self.curriculum_mode == "auto":
+            close_pos = np.array([table_x - 0.24, table_y - 0.13, OBJECT_Z])
+            far_pos = np.array([table_x, table_y, OBJECT_Z])
+            spawn = close_pos + self._difficulty * (far_pos - close_pos)
+            spawn[:2] += self.np_random.uniform(-DR_SPAWN_NOISE, DR_SPAWN_NOISE, size=2)
+            return spawn.astype(np.float64)
+
+        return np.array([table_x, table_y, OBJECT_Z], dtype=np.float64)
 
     def _object_out_of_bounds(self, i, obj):
         cfg = self.arm_cfg[i]
@@ -371,18 +429,36 @@ class URDualArmEnv(gym.Env):
             self.data.ctrl[grip_idx] = self.model.actuator_ctrlrange[grip_idx, 0]
 
         for i in range(self._n_arms):
+            if self.handover_mode and i in self._handover_pairs:
+                continue  # receiver shares giver's object; skip separate placement
+
             init_pos = self._reset_object_pos(i)
             self._obj_init_pos[i] = init_pos
             obj_qpos_adr = self._obj_qpos_adr[i]
             self.data.qpos[obj_qpos_adr:obj_qpos_adr + 3] = init_pos
             self.data.qpos[obj_qpos_adr + 3:obj_qpos_adr + 7] = [1, 0, 0, 0]
 
+            if self.domain_rand:
+                self.model.body_mass[self._obj_ids[i]] = float(
+                    self.np_random.uniform(DR_MASS_MIN, DR_MASS_MAX)
+                )
+                self.model.geom_friction[self._obj_geom_ids[i], 0] = float(
+                    self.np_random.uniform(DR_FRICTION_MIN, DR_FRICTION_MAX)
+                )
+
         initial_phase = 1 if self.curriculum_mode == "grasp_focus" else 0
         self._phase = [initial_phase] * self._n_arms
         self._prev_dist = [None] * self._n_arms
         self._grasped = [False] * self._n_arms
         self._grasp_streak = [0] * self._n_arms
+        self._arm_done = [False] * self._n_arms
+        self._handover_active = [True] * self._n_arms
         self._episode_steps = 0
+
+        if self.handover_mode:
+            for receiver_i in self._handover_pairs:
+                self._handover_active[receiver_i] = False
+                self._phase[receiver_i] = -1  # waiting for giver to complete
 
         mujoco.mj_forward(self.model, self.data)
         return self._get_obs(), {}
@@ -414,12 +490,43 @@ class URDualArmEnv(gym.Env):
 
         return left_contact, right_contact
 
+    def _grasp_quality(self, i):
+        """Force-symmetry score in [0, 1]. 1 = perfectly balanced left/right contact forces."""
+        obj_geom_id = self._obj_geom_ids[i]
+        left_force = 0.0
+        right_force = 0.0
+        force = np.zeros(6)
+
+        for ci in range(self.data.ncon):
+            c = self.data.contact[ci]
+            g1, g2 = int(c.geom1), int(c.geom2)
+            if g1 != obj_geom_id and g2 != obj_geom_id:
+                continue
+            other = g2 if g1 == obj_geom_id else g1
+            mujoco.mj_contactForce(self.model, self.data, ci, force)
+            f_mag = float(np.linalg.norm(force[:3]))
+            if other in self._left_pad_geom_ids[i]:
+                left_force += f_mag
+            elif other in self._right_pad_geom_ids[i]:
+                right_force += f_mag
+
+        total = left_force + right_force
+        if total < 1e-6:
+            return 0.0
+        return 1.0 - abs(left_force - right_force) / total
+
     def _is_carrying(self, grip, ee_to_obj, obj_lift, both_contacts):
         return grip > GRASP_CLOSE_THRESHOLD and (
             both_contacts or (obj_lift > CARRY_HEIGHT_THRESHOLD and ee_to_obj < 0.12)
         )
 
     def _arm_reward(self, i):
+        if self._arm_done[i]:
+            return 0.0, True, self._phase[i], False, False, False
+
+        if self.handover_mode and not self._handover_active[i]:
+            return 0.0, False, -1, False, False, False
+
         ee = self.data.site_xpos[self._ee_sites[i]].copy()
         obj = self.data.xpos[self._obj_ids[i]].copy()
         drop = self._drop_positions[i]
@@ -487,6 +594,7 @@ class URDualArmEnv(gym.Env):
                 reward += 24.0
             if both_contacts:
                 reward += 42.0
+                reward += self._grasp_quality(i) * 20.0
             if grip > 0.55 and not any_contact:
                 reward -= 3.0
             if grip < 0.15 and ee_to_obj < 0.05:
@@ -519,6 +627,9 @@ class URDualArmEnv(gym.Env):
                 delta = self._prev_dist[i] - dist_z
                 reward += delta * LIFT_DELTA_GAIN if delta > 0 else delta * 100.0
             self._prev_dist[i] = dist_z
+
+            if both_contacts:
+                reward += self._grasp_quality(i) * 15.0
 
             reward += max(0.0, obj_lift) * 340.0
             if carrying:
@@ -594,13 +705,11 @@ class URDualArmEnv(gym.Env):
 
         total_reward = 0.0
         info = {}
-        all_done = True
         phase_counts = {phase_idx: 0 for phase_idx in range(4)}
         carrying_count = 0
         any_contact_count = 0
         both_contacts_count = 0
         object_reset_count = 0
-        done_count = 0
         ee_to_obj_distances = []
         obj_heights = []
         obj_to_drop_distances = []
@@ -609,14 +718,24 @@ class URDualArmEnv(gym.Env):
         for i, name in enumerate(self.arm_names):
             reward, arm_done, phase, carrying, any_contact, both_contacts = self._arm_reward(i)
             total_reward += reward
-            if not arm_done:
-                all_done = False
+
+            if arm_done and not self._arm_done[i]:
+                self._arm_done[i] = True
+                if self.handover_mode and i in self._handover_giver_of:
+                    receiver_i = self._handover_giver_of[i]
+                    self._handover_active[receiver_i] = True
+                    self._phase[receiver_i] = 0
+                    self._prev_dist[receiver_i] = None
+                    self._obj_init_pos[receiver_i] = self.data.xpos[self._obj_ids[receiver_i]].copy()
 
             obj = self.data.xpos[self._obj_ids[i]].copy()
             ee = self.data.site_xpos[self._ee_sites[i]].copy()
             qpos_adr = self._arm_qpos_adr[i]
             ee_to_obj = float(np.linalg.norm(ee - obj))
-            object_reset = self._object_out_of_bounds(i, obj)
+
+            object_reset = False
+            if not self.handover_mode and not self._arm_done[i]:
+                object_reset = self._object_out_of_bounds(i, obj)
             if object_reset:
                 total_reward -= OBJECT_RESET_PENALTY
                 reward -= OBJECT_RESET_PENALTY
@@ -627,18 +746,20 @@ class URDualArmEnv(gym.Env):
                 any_contact = False
                 both_contacts = False
                 ee_to_obj = float(np.linalg.norm(ee - obj))
-            phase_counts[int(phase)] += 1
+
+            if phase >= 0:
+                phase_counts[int(phase)] = phase_counts.get(int(phase), 0) + 1
             carrying_count += int(carrying)
             any_contact_count += int(any_contact)
             both_contacts_count += int(both_contacts)
             object_reset_count += int(object_reset)
-            done_count += int(arm_done)
             ee_to_obj_distances.append(ee_to_obj)
             obj_heights.append(float(obj[2]))
             obj_to_drop_distances.append(float(np.linalg.norm(obj[:2] - self._drop_positions[i][:2])))
             arm_rewards.append(float(reward))
+
             info[f"{name}_phase"] = phase
-            info[f"{name}_done"] = arm_done
+            info[f"{name}_done"] = self._arm_done[i]
             info[f"{name}_reward"] = float(reward)
             info[f"{name}_object_reset"] = object_reset
             info[f"{name}_carrying"] = carrying
@@ -656,14 +777,14 @@ class URDualArmEnv(gym.Env):
 
         arm_count = max(self._n_arms, 1)
         info["scene_summary"] = {
-            "phase_counts": {str(phase_idx): count for phase_idx, count in phase_counts.items()},
-            "phase_fractions": {str(phase_idx): count / arm_count for phase_idx, count in phase_counts.items()},
-            "max_phase": max((phase_idx for phase_idx, count in phase_counts.items() if count > 0), default=0),
+            "phase_counts": {str(k): v for k, v in phase_counts.items()},
+            "phase_fractions": {str(k): v / arm_count for k, v in phase_counts.items()},
+            "max_phase": max((k for k, v in phase_counts.items() if v > 0), default=0),
             "carrying_count": carrying_count,
             "any_contact_count": any_contact_count,
             "both_contacts_count": both_contacts_count,
             "object_reset_count": object_reset_count,
-            "done_count": done_count,
+            "done_count": sum(self._arm_done),
             "mean_arm_reward": float(np.mean(arm_rewards)) if arm_rewards else 0.0,
             "mean_ee_to_obj": float(np.mean(ee_to_obj_distances)) if ee_to_obj_distances else 0.0,
             "min_ee_to_obj": float(np.min(ee_to_obj_distances)) if ee_to_obj_distances else 0.0,
@@ -671,10 +792,21 @@ class URDualArmEnv(gym.Env):
             "max_obj_height": float(np.max(obj_heights)) if obj_heights else 0.0,
             "mean_obj_to_drop": float(np.mean(obj_to_drop_distances)) if obj_to_drop_distances else 0.0,
             "min_obj_to_drop": float(np.min(obj_to_drop_distances)) if obj_to_drop_distances else 0.0,
+            "curriculum_difficulty": self._difficulty if self.curriculum_mode == "auto" else None,
         }
 
-        terminated = all_done
+        terminated = all(self._arm_done)
         truncated = self._episode_steps >= self.max_episode_steps
+
+        if terminated or truncated:
+            if self.curriculum_mode == "auto":
+                self._success_history.append(float(terminated))
+                if len(self._success_history) >= 10:
+                    rate = sum(self._success_history) / len(self._success_history)
+                    if rate > AUTO_CURRICULUM_INCREASE_THRESH:
+                        self._difficulty = min(1.0, self._difficulty + AUTO_CURRICULUM_STEP)
+                    elif rate < AUTO_CURRICULUM_DECREASE_THRESH:
+                        self._difficulty = max(0.0, self._difficulty - AUTO_CURRICULUM_STEP)
 
         if self.render_mode == "human":
             self.render()
