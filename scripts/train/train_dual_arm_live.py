@@ -56,9 +56,19 @@ def parse_args():
     )
     parser.add_argument(
         "--curriculum",
-        choices=["none", "easy_grasp"],
+        choices=["none", "easy_grasp", "grasp_focus", "auto"],
         default="none",
-        help="Optional environment curriculum. easy_grasp starts objects closer to the robot.",
+        help="Curriculum mode. 'auto' self-paces difficulty based on rolling success rate.",
+    )
+    parser.add_argument(
+        "--domain-rand",
+        action="store_true",
+        help="Randomise object mass and friction each episode for sim-to-real robustness.",
+    )
+    parser.add_argument(
+        "--handover",
+        action="store_true",
+        help="Handover mode: left arms drop at centre table, right arms pick up and carry to final drop.",
     )
     parser.add_argument(
         "--run-name",
@@ -69,9 +79,14 @@ def parse_args():
     return parser.parse_args()
 
 
-def make_env(arm_count, curriculum_mode):
+def make_env(arm_count, curriculum_mode, domain_rand=False, handover_mode=False):
     def _init():
-        return URDualArmEnv(arm_count=arm_count, curriculum_mode=curriculum_mode)
+        return URDualArmEnv(
+            arm_count=arm_count,
+            curriculum_mode=curriculum_mode,
+            domain_rand=domain_rand,
+            handover_mode=handover_mode,
+        )
 
     return _init
 
@@ -223,9 +238,12 @@ def main():
     with open(os.path.join(LOG_ROOT, "latest_run.txt"), "w", encoding="utf-8") as handle:
         handle.write(f"{run_dir}\n")
 
-    vec_env = DummyVecEnv([make_env(args.arms, args.curriculum) for _ in range(args.n_envs)])
+    vec_env = DummyVecEnv([
+        make_env(args.arms, args.curriculum, args.domain_rand, args.handover)
+        for _ in range(args.n_envs)
+    ])
     vec_env = VecMonitor(vec_env, filename=os.path.join(run_dir, "train_monitor.csv"))
-    eval_env = DummyVecEnv([make_env(args.arms, args.curriculum)])
+    eval_env = DummyVecEnv([make_env(args.arms, args.curriculum, args.domain_rand, args.handover)])
     eval_env = VecMonitor(eval_env, filename=os.path.join(run_dir, "eval_monitor.csv"))
 
     n_actions = vec_env.action_space.shape[0]
